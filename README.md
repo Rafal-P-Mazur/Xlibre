@@ -3,6 +3,8 @@ Epub to XTC converter
 
 A GUI-based tool designed to convert standard `.epub` files into the `.xtc` binary format required by the **Xteink X4** e-reader. It renders HTML content into paginated, bitmapped images optimized for e-ink displays.
 
+[![Web Version](https://img.shields.io/badge/Web_Version-Live-green)](https://epub2xtc.streamlit.app/)
+
 ## Main Features
 
 * **Smart Hyphenation:** Uses `pyphen` to inject soft hyphens into text nodes, ensuring proper line breaks and justified text flow.
