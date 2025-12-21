@@ -7,16 +7,14 @@ A GUI-based tool designed to convert standard `.epub` files into the `.xtc` bina
 
 * **Smart Hyphenation:** Uses `pyphen` to inject soft hyphens into text nodes, ensuring proper line breaks and justified text flow.
 * **Table of Contents Generation:** Automatically creates visual TOC pages at the start of the file, linked to specific rendered page numbers.
+* **Visual Progress Bar:** Generates a reading progress bar at the bottom of every page, including indicators for chapter start points.
 * **Custom Typography:** Supports system fonts and external `.ttf` / `.otf` fonts. Allows adjustment of font weight, size, and line height.
 * **Image Optimization:** Automatically extracts, scales, contrast-enhances, and dithers (Floyd-Steinberg) images embedded in the EPUB.
 * **Layout Control:** Configurable margins, top/bottom padding, and text alignment (Justified/Left).
 
-## Requirements
+![App Screenshot 1](images/xtc.png)
+![App Screenshot 2](images/xtc2.png)
 
-The application is written in Python 3. Install the required dependencies using pip:
-```bash
-pip install pymupdf Pillow EbookLib beautifulsoup4 pyphen customtkinter
-```
 
 ## 📥 Installation
 
@@ -36,7 +34,7 @@ pip install pymupdf Pillow EbookLib beautifulsoup4 pyphen customtkinter
     ```
 
 ### Option 2: Standalone Executable (.exe)
-If you have downloaded the Release version, simply unzip the file and run `EPUB2XTC.exe`. No python installation is required.
+If you have downloaded the [Release version](https://github.com/Rafal-P-Mazur/EPUB2XTC/releases), simply unzip the file and run `EPUB2XTC.exe`. No Python installation is required.
 
 ## 📖 User Manual
 
