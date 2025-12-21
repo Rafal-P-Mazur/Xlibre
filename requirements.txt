@@ -1,0 +1,6 @@
+PyMuPDF
+Pillow
+EbookLib
+beautifulsoup4
+Pyphen
+customtkinter
