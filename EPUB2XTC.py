@@ -9,20 +9,44 @@ from bs4 import BeautifulSoup, NavigableString
 import pyphen
 import base64
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import threading
 import re
+import json
+import glob
 
 # --- CONFIGURATION DEFAULTS ---
 DEFAULT_SCREEN_WIDTH = 480
 DEFAULT_SCREEN_HEIGHT = 800
 DEFAULT_RENDER_SCALE = 3.0
-DEFAULT_FONT_SIZE = 22
-DEFAULT_MARGIN = 20
-DEFAULT_LINE_HEIGHT = 1.4
-DEFAULT_FONT_WEIGHT = 400
-DEFAULT_BOTTOM_PADDING = 15
-DEFAULT_TOP_PADDING = 15
+
+# --- FACTORY DEFAULTS ---
+FACTORY_DEFAULTS = {
+    "font_size": 22,
+    "font_weight": 400,
+    "line_height": 1.4,
+    "margin": 20,
+    "top_padding": 15,
+    "bottom_padding": 45,
+    "orientation": "Portrait",
+    "text_align": "justify",
+    "font_name": "Default (System)",
+    "preview_zoom": 300,
+    "generate_toc": True,
+
+    # --- FOOTER DEFAULTS ---
+    "footer_visible": True,
+    "footer_font_size": 16,
+    "footer_show_progress": True,
+    "footer_show_pagenum": True,
+    "footer_show_title": True,
+    "footer_text_pos": "Text Above Bar",
+    "footer_bar_height": 4,
+    "footer_bottom_margin": 10
+}
+
+SETTINGS_FILE = "default_settings.json"
+PRESETS_DIR = "presets"
 
 
 # --- UTILITY FUNCTIONS ---
@@ -197,16 +221,27 @@ class EpubProcessor:
         self.book_images = {}
         self.book_lang = 'en'
 
+        # Default values
         self.font_path = ""
-        self.font_size = DEFAULT_FONT_SIZE
-        self.margin = DEFAULT_MARGIN
-        self.line_height = DEFAULT_LINE_HEIGHT
-        self.font_weight = DEFAULT_FONT_WEIGHT
-        self.bottom_padding = DEFAULT_BOTTOM_PADDING
-        self.top_padding = DEFAULT_TOP_PADDING
-        self.text_align = "justify"
+        self.font_size = FACTORY_DEFAULTS["font_size"]
+        self.margin = FACTORY_DEFAULTS["margin"]
+        self.line_height = FACTORY_DEFAULTS["line_height"]
+        self.font_weight = FACTORY_DEFAULTS["font_weight"]
+        self.bottom_padding = FACTORY_DEFAULTS["bottom_padding"]
+        self.top_padding = FACTORY_DEFAULTS["top_padding"]
+        self.text_align = FACTORY_DEFAULTS["text_align"]
         self.screen_width = DEFAULT_SCREEN_WIDTH
         self.screen_height = DEFAULT_SCREEN_HEIGHT
+
+        # Footer Settings
+        self.footer_visible = FACTORY_DEFAULTS["footer_visible"]
+        self.footer_font_size = FACTORY_DEFAULTS["footer_font_size"]
+        self.footer_show_progress = FACTORY_DEFAULTS["footer_show_progress"]
+        self.footer_show_pagenum = FACTORY_DEFAULTS["footer_show_pagenum"]
+        self.footer_show_title = FACTORY_DEFAULTS["footer_show_title"]
+        self.footer_text_pos = FACTORY_DEFAULTS["footer_text_pos"]
+        self.footer_bar_height = FACTORY_DEFAULTS["footer_bar_height"]
+        self.footer_bottom_margin = FACTORY_DEFAULTS["footer_bottom_margin"]
 
         self.fitz_docs = []
         self.toc_data_final = []
@@ -261,7 +296,7 @@ class EpubProcessor:
 
     def render_chapters(self, selected_indices, font_path, font_size, margin, line_height, font_weight,
                         bottom_padding, top_padding, text_align="justify", orientation="Portrait", add_toc=True,
-                        progress_callback=None):
+                        footer_settings=None, progress_callback=None):
 
         self.font_path = font_path if font_path != "DEFAULT" else ""
         self.font_size = font_size
@@ -271,6 +306,17 @@ class EpubProcessor:
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
+
+        # Apply Footer Settings
+        if footer_settings:
+            self.footer_visible = footer_settings.get("footer_visible", True)
+            self.footer_font_size = footer_settings.get("footer_font_size", 16)
+            self.footer_show_progress = footer_settings.get("footer_show_progress", True)
+            self.footer_show_pagenum = footer_settings.get("footer_show_pagenum", True)
+            self.footer_show_title = footer_settings.get("footer_show_title", True)
+            self.footer_text_pos = footer_settings.get("footer_text_pos", "Text Above Bar")
+            self.footer_bar_height = footer_settings.get("footer_bar_height", 4)
+            self.footer_bottom_margin = footer_settings.get("footer_bottom_margin", 10)
 
         if orientation == "Landscape":
             self.screen_width = DEFAULT_SCREEN_HEIGHT
@@ -359,16 +405,22 @@ class EpubProcessor:
         if os.path.exists(temp_html_path): os.remove(temp_html_path)
 
         if add_toc and final_toc_titles:
+            toc_main_size = self.font_size
+            toc_header_size = int(self.font_size * 1.2)
+            toc_row_height = int(self.font_size * self.line_height * 1.2)
             toc_header_space = 100 + self.top_padding
-            toc_row_height = 35
-            available_h = self.screen_height - self.bottom_padding - toc_header_space
+
+            reserved_top = toc_header_space
+            reserved_bottom = self.bottom_padding
+            available_h = self.screen_height - reserved_top - reserved_bottom
 
             self.toc_items_per_page = max(1, int(available_h // toc_row_height))
             num_toc_pages = (len(final_toc_titles) + self.toc_items_per_page - 1) // self.toc_items_per_page
 
             self.toc_data_final = [(t, temp_chapter_starts[i] + num_toc_pages + 1) for i, t in
                                    enumerate(final_toc_titles)]
-            self.toc_pages_images = self._render_toc_pages(self.toc_data_final)
+            self.toc_pages_images = self._render_toc_pages(self.toc_data_final, toc_row_height, toc_main_size,
+                                                           toc_header_size)
         else:
             self.toc_data_final = [(t, temp_chapter_starts[i] + 1) for i, t in enumerate(final_toc_titles)]
             self.toc_pages_images = []
@@ -386,7 +438,7 @@ class EpubProcessor:
         except:
             return ImageFont.load_default()
 
-    def _render_toc_pages(self, toc_entries):
+    def _render_toc_pages(self, toc_entries, row_height, font_size, header_size):
         pages = []
 
         def get_dynamic_toc_font(size):
@@ -396,9 +448,14 @@ class EpubProcessor:
             except:
                 return ImageFont.load_default()
 
-        font_main = get_dynamic_toc_font(20)
-        font_header = get_dynamic_toc_font(24)
-        left_margin, right_margin, column_gap = 40, 40, 20
+        font_main = get_dynamic_toc_font(font_size)
+        font_header = get_dynamic_toc_font(header_size)
+
+        # --- MATCHING WEB MARGINS ---
+        # Web uses hardcoded margins for TOC pages
+        left_margin = 40
+        right_margin = 40
+        column_gap = 20
 
         limit = self.toc_items_per_page
 
@@ -409,30 +466,40 @@ class EpubProcessor:
 
             header_text = "TABLE OF CONTENTS"
             header_w = font_header.getlength(header_text)
+
+            # Web Logic: 40 + top_padding
             header_y = 40 + self.top_padding
+
             draw.text(((self.screen_width - header_w) // 2, header_y), header_text, font=font_header, fill=0)
 
-            line_y = header_y + 35
+            line_y = header_y + int(header_size * 1.5)
             draw.line((left_margin, line_y, self.screen_width - right_margin, line_y), fill=0)
 
-            y = line_y + 25
+            y = line_y + int(font_size * 1.2)
+
             for title, pg_num in chunk:
                 pg_str = str(pg_num)
                 pg_w = font_main.getlength(pg_str)
+
                 max_title_w = self.screen_width - left_margin - right_margin - pg_w - column_gap
+
                 display_title = title
                 if font_main.getlength(display_title) > max_title_w:
                     while font_main.getlength(display_title + "...") > max_title_w and len(display_title) > 0:
                         display_title = display_title[:-1]
                     display_title += "..."
+
                 draw.text((left_margin, y), display_title, font=font_main, fill=0)
+
                 title_end_x = left_margin + font_main.getlength(display_title) + 5
                 dots_end_x = self.screen_width - right_margin - pg_w - 10
+
                 if dots_end_x > title_end_x:
                     dots_text = "." * int((dots_end_x - title_end_x) / font_main.getlength("."))
                     draw.text((title_end_x, y), dots_text, font=font_main, fill=0)
+
                 draw.text((self.screen_width - right_margin - pg_w, y), pg_str, font=font_main, fill=0)
-                y += 35
+                y += row_height
             pages.append(img)
         return pages
 
@@ -440,6 +507,7 @@ class EpubProcessor:
         if not self.is_ready: return None
         num_toc = len(self.toc_pages_images)
 
+        # Footer Rendering Logic
         footer_height = max(0, self.bottom_padding)
         header_height = max(0, self.top_padding)
         content_height = self.screen_height - footer_height - header_height
@@ -468,38 +536,96 @@ class EpubProcessor:
                 img = ImageEnhance.Contrast(img).enhance(2.0).point(lambda p: 255 if p > 140 else 0, mode='1')
             img = img.convert("RGB")
 
-        draw = ImageDraw.Draw(img)
-        font_ui = self._get_ui_font(16)
+        # --- DYNAMIC FOOTER RENDERING ---
+        if self.footer_visible:
+            draw = ImageDraw.Draw(img)
 
-        page_num_disp = global_page_index + 1
-        current_title = ""
+            # 1. Clean background for footer area based on user margin + buffer
+            clean_start_y = self.screen_height - self.bottom_padding
+            draw.rectangle([0, clean_start_y, self.screen_width, self.screen_height], fill=(255, 255, 255))
 
-        chapter_pages = [item[1] for item in self.toc_data_final]
+            # 2. Calculate Layout
+            font_ui = self._get_ui_font(self.footer_font_size)
+            text_height_px = int(self.footer_font_size * 1.3)
+            bar_thickness = self.footer_bar_height if self.footer_show_progress else 0
 
-        for title, start_pg in reversed(self.toc_data_final):
-            if page_num_disp >= start_pg:
-                current_title = title
-                break
+            element_gap = 5
 
-        bar_height = 4
-        bar_y_top = self.screen_height - 20
-        footer_y = self.screen_height - 45
+            # Position Reference: footer_bottom_margin is distance from BOTTOM of screen
+            base_y = self.screen_height - self.footer_bottom_margin
 
-        draw.rectangle([10, bar_y_top, self.screen_width - 10, bar_y_top + bar_height], fill=(255, 255, 255),
-                       outline=(0, 0, 0))
+            bar_y = 0
+            text_y = 0
 
-        for cp in chapter_pages:
-            if self.total_pages > 0:
-                mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
-                draw.line([mx, bar_y_top - 4, mx, bar_y_top], fill=(0, 0, 0), width=1)
+            if self.footer_text_pos == "Text Above Bar":
+                # Layout from bottom up: Margin -> Bar -> Gap -> Text
+                if self.footer_show_progress:
+                    bar_y = base_y - bar_thickness
+                    text_ref = bar_y - element_gap
+                else:
+                    text_ref = base_y
 
-        if self.total_pages > 0:
-            bw = int((page_num_disp / self.total_pages) * (self.screen_width - 20))
-            draw.rectangle([10, bar_y_top, 10 + bw, bar_y_top + bar_height], fill=(0, 0, 0))
+                text_y = text_ref - text_height_px + 3  # +3 adjustment for font baseline
 
-        draw.text((15, footer_y), f"{page_num_disp}/{self.total_pages}", font=font_ui, fill=(0, 0, 0))
-        if current_title:
-            draw.text((100, footer_y), f"| {current_title}"[:35], font=font_ui, fill=(0, 0, 0))
+            else:  # "Text Below Bar"
+                # Layout from bottom up: Margin -> Text -> Gap -> Bar
+                has_text = self.footer_show_pagenum or self.footer_show_title
+                if has_text:
+                    text_y = base_y - text_height_px
+                    bar_ref = text_y - element_gap
+                else:
+                    bar_ref = base_y
+
+                bar_y = bar_ref - bar_thickness
+
+            # 3. Draw Progress Bar
+            if self.footer_show_progress:
+                draw.rectangle([10, bar_y, self.screen_width - 10, bar_y + bar_thickness], fill=(255, 255, 255),
+                               outline=(0, 0, 0))
+
+                # Chapters ticks
+                chapter_pages = [item[1] for item in self.toc_data_final]
+                for cp in chapter_pages:
+                    if self.total_pages > 0:
+                        mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
+                        draw.line([mx, bar_y - 1, mx, bar_y + bar_thickness + 1], fill=(0, 0, 0), width=1)
+
+                # Fill progress
+                page_num_disp = global_page_index + 1
+                if self.total_pages > 0:
+                    bw = int((page_num_disp / self.total_pages) * (self.screen_width - 20))
+                    draw.rectangle([10, bar_y, 10 + bw, bar_y + bar_thickness], fill=(0, 0, 0))
+
+            # 4. Draw Text Elements
+            has_text = self.footer_show_pagenum or self.footer_show_title
+            if has_text:
+                page_num_disp = global_page_index + 1
+                current_title = ""
+                for title, start_pg in reversed(self.toc_data_final):
+                    if page_num_disp >= start_pg:
+                        current_title = title
+                        break
+
+                cursor_x = 15
+
+                # Draw Page Num
+                if self.footer_show_pagenum:
+                    pg_text = f"{page_num_disp}/{self.total_pages}"
+                    draw.text((cursor_x, text_y), pg_text, font=font_ui, fill=(0, 0, 0))
+                    cursor_x += font_ui.getlength(pg_text) + 15
+
+                    if self.footer_show_title and current_title:
+                        draw.text((cursor_x - 10, text_y), "|", font=font_ui, fill=(0, 0, 0))
+
+                # Draw Title
+                if self.footer_show_title and current_title:
+                    available_width = self.screen_width - cursor_x - 10
+                    display_title = current_title
+                    if font_ui.getlength(display_title) > available_width:
+                        while font_ui.getlength(display_title + "...") > available_width and len(display_title) > 0:
+                            display_title = display_title[:-1]
+                        display_title += "..."
+                    draw.text((cursor_x, text_y), display_title, font=font_ui, fill=(0, 0, 0))
 
         return img
 
@@ -531,91 +657,210 @@ class App(ctk.CTk):
         self.is_processing = False
         self.selected_chapter_indices = []
 
-        self.title("EPUB to XTC Converter - Live Preview")
-        self.geometry("1100x950")
+        # --- PRESETS SETUP ---
+        if not os.path.exists(PRESETS_DIR):
+            os.makedirs(PRESETS_DIR)
+
+        # LOAD STARTUP DEFAULTS
+        self.startup_settings = FACTORY_DEFAULTS.copy()
+        self.load_startup_defaults()
+
+        self.title("EPUB2XTC")
+        self.geometry("1280x950")
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.sidebar = ctk.CTkScrollableFrame(self, width=300, corner_radius=0)
+        # WIDER SIDEBAR
+        self.sidebar = ctk.CTkScrollableFrame(self, width=480, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
 
-        ctk.CTkButton(self.sidebar, text="Select EPUB", command=self.select_file).pack(padx=20, pady=(20, 5), fill="x")
+        # --- SECTION: FILE & PRESETS ---
+        ctk.CTkButton(self.sidebar, text="Select EPUB", command=self.select_file).pack(padx=10, pady=(20, 5), fill="x")
         self.lbl_file = ctk.CTkLabel(self.sidebar, text="No file", text_color="gray")
         self.lbl_file.pack()
 
-        self.var_toc = ctk.BooleanVar(value=True)
+        self.frm_presets = ctk.CTkFrame(self.sidebar, fg_color="#333")
+        self.frm_presets.pack(fill="x", padx=10, pady=10)
+
+        ctk.CTkLabel(self.frm_presets, text="Manage Presets").pack(pady=(5, 0))
+
+        self.preset_var = ctk.StringVar(value="Select Preset...")
+        self.preset_dropdown = ctk.CTkOptionMenu(self.frm_presets, variable=self.preset_var, values=[],
+                                                 command=self.load_selected_preset)
+        self.preset_dropdown.pack(fill="x", padx=10, pady=5)
+        self.refresh_presets_list()
+
+        self.btn_save_preset = ctk.CTkButton(self.frm_presets, text="Save New Preset", command=self.save_new_preset,
+                                             height=24, fg_color="green")
+        self.btn_save_preset.pack(fill="x", padx=10, pady=5)
+
+        self.btn_save_default = ctk.CTkButton(self.frm_presets, text="Save as Startup Default",
+                                              command=self.save_current_as_default, height=24, fg_color="#D35400")
+        self.btn_save_default.pack(fill="x", padx=10, pady=(5, 10))
+
+        # --- SECTION: GLOBAL SETTINGS ---
+        self.var_toc = ctk.BooleanVar(value=self.startup_settings["generate_toc"])
         self.check_toc = ctk.CTkCheckBox(self.sidebar, text="Generate TOC Pages", variable=self.var_toc,
                                          command=self.schedule_update)
-        self.check_toc.pack(padx=20, pady=10, anchor="w")
+        self.check_toc.pack(padx=20, pady=5, anchor="w")
 
         self.btn_chapters = ctk.CTkButton(self.sidebar, text="Edit Chapter Visibility",
                                           command=self.open_chapter_dialog, state="disabled", fg_color="gray")
         self.btn_chapters.pack(padx=20, pady=5, fill="x")
 
-        ctk.CTkLabel(self.sidebar, text="Orientation:").pack(pady=(10, 0))
-        self.orientation_var = ctk.StringVar(value="Portrait")
-        self.orientation_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["Portrait", "Landscape"],
+        ctk.CTkLabel(self.sidebar, text="--- Layout & Typography ---").pack(pady=(15, 5))
+
+        # --- LAYOUT GRID ---
+        self.cols_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.cols_frame.pack(fill="x", padx=5, pady=5)
+
+        self.col_left = ctk.CTkFrame(self.cols_frame, fg_color="transparent")
+        self.col_left.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.col_right = ctk.CTkFrame(self.cols_frame, fg_color="transparent")
+        self.col_right.pack(side="right", fill="both", expand=True, padx=5)
+
+        # === LEFT COLUMN ===
+        ctk.CTkLabel(self.col_left, text="Orientation:").pack(pady=(5, 0))
+        self.orientation_var = ctk.StringVar(value=self.startup_settings["orientation"])
+        self.orientation_dropdown = ctk.CTkOptionMenu(self.col_left, values=["Portrait", "Landscape"],
                                                       variable=self.orientation_var, command=self.schedule_update)
-        self.orientation_dropdown.pack(padx=20, pady=5, fill="x")
+        self.orientation_dropdown.pack(fill="x", pady=5)
 
-        ctk.CTkLabel(self.sidebar, text="Text Alignment:").pack(pady=(10, 0))
-        self.align_dropdown = ctk.CTkOptionMenu(self.sidebar, values=["justify", "left"], command=self.schedule_update)
-        self.align_dropdown.set("justify")
-        self.align_dropdown.pack(padx=20, pady=5, fill="x")
-
-        ctk.CTkLabel(self.sidebar, text="Select Font:").pack(pady=(10, 0))
+        ctk.CTkLabel(self.col_left, text="Font Family:").pack(pady=(5, 0))
         self.available_fonts = get_local_fonts()
         self.font_options = ["Default (System)"] + [os.path.basename(f) for f in self.available_fonts]
         self.font_map = {os.path.basename(f): f for f in self.available_fonts}
         self.font_map["Default (System)"] = "DEFAULT"
-        self.font_dropdown = ctk.CTkOptionMenu(self.sidebar, values=self.font_options, command=self.on_font_change)
-        self.font_dropdown.pack(padx=20, pady=5, fill="x")
+        self.font_dropdown = ctk.CTkOptionMenu(self.col_left, values=self.font_options, command=self.on_font_change)
 
-        self.lbl_preview_zoom = ctk.CTkLabel(self.sidebar, text="Preview Zoom: 300")
-        self.lbl_preview_zoom.pack(pady=(20, 0))
-        self.slider_preview_zoom = ctk.CTkSlider(self.sidebar, from_=200, to=800, command=self.update_zoom_only)
-        self.slider_preview_zoom.set(300)
-        self.slider_preview_zoom.pack(padx=20, pady=5, fill="x")
+        if self.startup_settings["font_name"] in self.font_options:
+            self.font_dropdown.set(self.startup_settings["font_name"])
+        else:
+            self.font_dropdown.set("Default (System)")
+        self.font_dropdown.pack(fill="x", pady=5)
+        self.processor.font_path = self.font_map[self.font_dropdown.get()]
 
-        self.lbl_size = ctk.CTkLabel(self.sidebar, text=f"Font Size: {DEFAULT_FONT_SIZE}pt")
-        self.lbl_size.pack()
-        self.slider_size = ctk.CTkSlider(self.sidebar, from_=12, to=36, command=self.update_size_label)
-        self.slider_size.set(DEFAULT_FONT_SIZE)
-        self.slider_size.pack(padx=20, pady=5, fill="x")
+        self.lbl_size = ctk.CTkLabel(self.col_left, text=f"Font Size: {self.startup_settings['font_size']}pt")
+        self.lbl_size.pack(pady=(5, 0))
+        self.slider_size = ctk.CTkSlider(self.col_left, from_=12, to=48, command=self.update_size_label)
+        self.slider_size.set(self.startup_settings['font_size'])
+        self.slider_size.pack(fill="x", pady=5)
 
-        self.lbl_weight = ctk.CTkLabel(self.sidebar, text=f"Font Weight: {DEFAULT_FONT_WEIGHT}")
-        self.lbl_weight.pack()
-        self.slider_weight = ctk.CTkSlider(self.sidebar, from_=100, to=900, number_of_steps=8,
+        self.lbl_margin = ctk.CTkLabel(self.col_left, text=f"Margin: {self.startup_settings['margin']}px")
+        self.lbl_margin.pack(pady=(5, 0))
+        self.slider_margin = ctk.CTkSlider(self.col_left, from_=0, to=100, command=self.update_margin_label)
+        self.slider_margin.set(self.startup_settings['margin'])
+        self.slider_margin.pack(fill="x", pady=5)
+
+        self.lbl_top_padding = ctk.CTkLabel(self.col_left,
+                                            text=f"Top Padding: {self.startup_settings['top_padding']}px")
+        self.lbl_top_padding.pack(pady=(5, 0))
+        self.slider_top_padding = ctk.CTkSlider(self.col_left, from_=0, to=100, command=self.update_top_padding_label)
+        self.slider_top_padding.set(self.startup_settings['top_padding'])
+        self.slider_top_padding.pack(fill="x", pady=5)
+
+        # === RIGHT COLUMN ===
+        ctk.CTkLabel(self.col_right, text="Text Alignment:").pack(pady=(5, 0))
+        self.align_dropdown = ctk.CTkOptionMenu(self.col_right, values=["justify", "left"],
+                                                command=self.schedule_update)
+        self.align_dropdown.set(self.startup_settings["text_align"])
+        self.align_dropdown.pack(fill="x", pady=5)
+
+        self.lbl_weight = ctk.CTkLabel(self.col_right, text=f"Font Weight: {self.startup_settings['font_weight']}")
+        self.lbl_weight.pack(pady=(5, 0))
+        self.slider_weight = ctk.CTkSlider(self.col_right, from_=100, to=900, number_of_steps=8,
                                            command=self.update_weight_label)
-        self.slider_weight.set(DEFAULT_FONT_WEIGHT)
-        self.slider_weight.pack(padx=20, pady=5, fill="x")
+        self.slider_weight.set(self.startup_settings['font_weight'])
+        self.slider_weight.pack(fill="x", pady=5)
 
-        self.lbl_line = ctk.CTkLabel(self.sidebar, text=f"Line Height: {DEFAULT_LINE_HEIGHT}")
-        self.lbl_line.pack()
-        self.slider_line = ctk.CTkSlider(self.sidebar, from_=1.0, to=2.5, command=self.update_line_label)
-        self.slider_line.set(DEFAULT_LINE_HEIGHT)
-        self.slider_line.pack(padx=20, pady=5, fill="x")
+        self.lbl_line = ctk.CTkLabel(self.col_right, text=f"Line Height: {self.startup_settings['line_height']}")
+        self.lbl_line.pack(pady=(5, 0))
+        self.slider_line = ctk.CTkSlider(self.col_right, from_=1.0, to=2.5, command=self.update_line_label)
+        self.slider_line.set(self.startup_settings['line_height'])
+        self.slider_line.pack(fill="x", pady=5)
 
-        self.lbl_margin = ctk.CTkLabel(self.sidebar, text=f"Margin: {DEFAULT_MARGIN}px")
-        self.lbl_margin.pack()
-        self.slider_margin = ctk.CTkSlider(self.sidebar, from_=0, to=100, command=self.update_margin_label)
-        self.slider_margin.set(DEFAULT_MARGIN)
-        self.slider_margin.pack(padx=20, pady=5, fill="x")
+        self.lbl_preview_zoom = ctk.CTkLabel(self.col_right,
+                                             text=f"Preview Zoom: {self.startup_settings['preview_zoom']}")
+        self.lbl_preview_zoom.pack(pady=(5, 0))
+        self.slider_preview_zoom = ctk.CTkSlider(self.col_right, from_=200, to=800, command=self.update_zoom_only)
+        self.slider_preview_zoom.set(self.startup_settings['preview_zoom'])
+        self.slider_preview_zoom.pack(fill="x", pady=5)
 
-        self.lbl_top_padding = ctk.CTkLabel(self.sidebar, text=f"Top Padding: {DEFAULT_TOP_PADDING}px")
-        self.lbl_top_padding.pack()
-        self.slider_top_padding = ctk.CTkSlider(self.sidebar, from_=0, to=100, command=self.update_top_padding_label)
-        self.slider_top_padding.set(DEFAULT_TOP_PADDING)
-        self.slider_top_padding.pack(padx=20, pady=5, fill="x")
+        self.lbl_padding = ctk.CTkLabel(self.col_right,
+                                        text=f"Bottom Padding: {self.startup_settings['bottom_padding']}px")
+        self.lbl_padding.pack(pady=(5, 0))
+        self.slider_padding = ctk.CTkSlider(self.col_right, from_=0, to=150, command=self.update_padding_label)
+        self.slider_padding.set(self.startup_settings['bottom_padding'])
+        self.slider_padding.pack(fill="x", pady=5)
 
-        self.lbl_padding = ctk.CTkLabel(self.sidebar, text=f"Bottom Padding: {DEFAULT_BOTTOM_PADDING}px")
-        self.lbl_padding.pack()
-        self.slider_padding = ctk.CTkSlider(self.sidebar, from_=0, to=100, command=self.update_padding_label)
-        self.slider_padding.set(DEFAULT_BOTTOM_PADDING)
-        self.slider_padding.pack(padx=20, pady=5, fill="x")
+        # --- SECTION: FOOTER CUSTOMIZATION (MATCHING STYLE) ---
+        ctk.CTkLabel(self.sidebar, text="--- Footer Settings ---").pack(pady=(15, 5))
+
+        self.var_footer_visible = ctk.BooleanVar(value=self.startup_settings.get("footer_visible", True))
+        self.check_footer_vis = ctk.CTkCheckBox(self.sidebar, text="Show Footer Area", variable=self.var_footer_visible,
+                                                command=self.schedule_update)
+        self.check_footer_vis.pack(padx=20, pady=5, anchor="center")
+
+        # Two-Column Layout (Matching above)
+        self.footer_cols = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.footer_cols.pack(fill="x", padx=5, pady=5)
+
+        self.f_col1 = ctk.CTkFrame(self.footer_cols, fg_color="transparent")
+        self.f_col1.pack(side="left", fill="both", expand=True, padx=5)
+
+        self.f_col2 = ctk.CTkFrame(self.footer_cols, fg_color="transparent")
+        self.f_col2.pack(side="right", fill="both", expand=True, padx=5)
+
+        # COL 1: CONTENT & POS
+        self.var_footer_prog = ctk.BooleanVar(value=self.startup_settings.get("footer_show_progress", True))
+        ctk.CTkCheckBox(self.f_col1, text="Progress Bar", variable=self.var_footer_prog,
+                        command=self.schedule_update).pack(pady=2, anchor="w")
+
+        self.var_footer_pg = ctk.BooleanVar(value=self.startup_settings.get("footer_show_pagenum", True))
+        ctk.CTkCheckBox(self.f_col1, text="Page Numbers", variable=self.var_footer_pg,
+                        command=self.schedule_update).pack(pady=2, anchor="w")
+
+        self.var_footer_title = ctk.BooleanVar(value=self.startup_settings.get("footer_show_title", True))
+        ctk.CTkCheckBox(self.f_col1, text="Chapter Title", variable=self.var_footer_title,
+                        command=self.schedule_update).pack(pady=2, anchor="w")
+
+        ctk.CTkLabel(self.f_col1, text="Text Position:").pack(pady=(10, 0))
+        self.footer_pos_var = ctk.StringVar(value=self.startup_settings.get("footer_text_pos", "Text Above Bar"))
+        ctk.CTkOptionMenu(self.f_col1, variable=self.footer_pos_var, values=["Text Above Bar", "Text Below Bar"],
+                          command=self.schedule_update).pack(fill="x", pady=2)
+
+        # COL 2: SLIDERS
+        self.lbl_footer_size = ctk.CTkLabel(self.f_col2,
+                                            text=f"Text Size: {self.startup_settings.get('footer_font_size', 16)}pt")
+        self.lbl_footer_size.pack(anchor="w", pady=(0, 0))
+        self.slider_footer_size = ctk.CTkSlider(self.f_col2, from_=10, to=24, height=16,
+                                                command=self.update_footer_size_label)
+        self.slider_footer_size.set(self.startup_settings.get('footer_font_size', 16))
+        self.slider_footer_size.pack(fill="x", pady=5)
+
+        self.lbl_bar_thick = ctk.CTkLabel(self.f_col2,
+                                          text=f"Bar Thick: {self.startup_settings.get('footer_bar_height', 4)}px")
+        self.lbl_bar_thick.pack(anchor="w", pady=(5, 0))
+        self.slider_bar_thick = ctk.CTkSlider(self.f_col2, from_=1, to=10, height=16,
+                                              command=self.update_bar_thick_label)
+        self.slider_bar_thick.set(self.startup_settings.get('footer_bar_height', 4))
+        self.slider_bar_thick.pack(fill="x", pady=5)
+
+        self.lbl_footer_margin = ctk.CTkLabel(self.f_col2,
+                                              text=f"Footer position: {self.startup_settings.get('footer_bottom_margin', 10)}px")
+        self.lbl_footer_margin.pack(anchor="w", pady=(5, 0))
+        self.slider_footer_margin = ctk.CTkSlider(self.f_col2, from_=0, to=50, height=16,
+                                                  command=self.update_footer_margin_label)
+        self.slider_footer_margin.set(self.startup_settings.get('footer_bottom_margin', 10))
+        self.slider_footer_margin.pack(fill="x", pady=5)
+
+        # --- SECTION: FOOTER ACTIONS ---
+        ctk.CTkButton(self.sidebar, text="Reset to Factory Defaults", command=self.reset_to_factory,
+                      fg_color="#555").pack(padx=20, pady=20, fill="x")
 
         self.btn_run = ctk.CTkButton(self.sidebar, text="Force Refresh", fg_color="gray", command=self.run_processing)
-        self.btn_run.pack(padx=20, pady=20, fill="x")
+        self.btn_run.pack(padx=20, pady=5, fill="x")
 
         self.btn_export = ctk.CTkButton(self.sidebar, text="Export XTC", state="disabled", command=self.export_file)
         self.btn_export.pack(padx=20, pady=5, fill="x")
@@ -626,6 +871,7 @@ class App(ctk.CTk):
         self.progress_label = ctk.CTkLabel(self.sidebar, text="Progress: Ready")
         self.progress_label.pack()
 
+        # --- PREVIEW AREA ---
         self.preview_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.preview_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
         self.img_label = ctk.CTkLabel(self.preview_frame, text="Load EPUB to Preview")
@@ -652,6 +898,145 @@ class App(ctk.CTk):
 
         self.btn_go = ctk.CTkButton(self.goto_frame, text="Go", width=40, height=24, command=self.go_to_page)
         self.btn_go.pack(side="left")
+
+    # --- PRESET & SETTINGS LOGIC ---
+
+    def gather_current_ui_settings(self):
+        return {
+            "font_size": int(self.slider_size.get()),
+            "font_weight": int(self.slider_weight.get()),
+            "line_height": float(self.slider_line.get()),
+            "margin": int(self.slider_margin.get()),
+            "top_padding": int(self.slider_top_padding.get()),
+            "bottom_padding": int(self.slider_padding.get()),
+            "orientation": self.orientation_var.get(),
+            "text_align": self.align_dropdown.get(),
+            "font_name": self.font_dropdown.get(),
+            "preview_zoom": int(self.slider_preview_zoom.get()),
+            "generate_toc": self.var_toc.get(),
+
+            # Footer
+            "footer_visible": self.var_footer_visible.get(),
+            "footer_font_size": int(self.slider_footer_size.get()),
+            "footer_show_progress": self.var_footer_prog.get(),
+            "footer_show_pagenum": self.var_footer_pg.get(),
+            "footer_show_title": self.var_footer_title.get(),
+            "footer_text_pos": self.footer_pos_var.get(),
+            "footer_bar_height": int(self.slider_bar_thick.get()),
+            "footer_bottom_margin": int(self.slider_footer_margin.get())
+        }
+
+    def apply_settings_dict(self, s):
+        defaults = FACTORY_DEFAULTS.copy()
+        defaults.update(s)
+        s = defaults
+
+        self.slider_size.set(s['font_size'])
+        self.slider_weight.set(s['font_weight'])
+        self.slider_line.set(s['line_height'])
+        self.slider_margin.set(s['margin'])
+        self.slider_top_padding.set(s['top_padding'])
+        self.slider_padding.set(s['bottom_padding'])
+        self.orientation_var.set(s['orientation'])
+        self.align_dropdown.set(s['text_align'])
+        self.slider_preview_zoom.set(s['preview_zoom'])
+        self.var_toc.set(s['generate_toc'])
+
+        # Footer
+        self.var_footer_visible.set(s['footer_visible'])
+        self.slider_footer_size.set(s['footer_font_size'])
+        self.var_footer_prog.set(s['footer_show_progress'])
+        self.var_footer_pg.set(s['footer_show_pagenum'])
+        self.var_footer_title.set(s['footer_show_title'])
+        self.footer_pos_var.set(s['footer_text_pos'])
+        self.slider_bar_thick.set(s['footer_bar_height'])
+        self.slider_footer_margin.set(s['footer_bottom_margin'])
+
+        if s["font_name"] in self.font_options:
+            self.font_dropdown.set(s["font_name"])
+            self.processor.font_path = self.font_map[s["font_name"]]
+        else:
+            self.font_dropdown.set("Default (System)")
+            self.processor.font_path = self.font_map["Default (System)"]
+
+        # Update text labels
+        self.update_size_label(s['font_size'])
+        self.update_weight_label(s['font_weight'])
+        self.update_line_label(s['line_height'])
+        self.update_margin_label(s['margin'])
+        self.update_top_padding_label(s['top_padding'])
+        self.update_padding_label(s['bottom_padding'])
+        self.update_zoom_only(s['preview_zoom'])
+        self.update_footer_size_label(s['footer_font_size'])
+        self.update_bar_thick_label(s['footer_bar_height'])
+        self.update_footer_margin_label(s['footer_bottom_margin'])
+
+        self.schedule_update()
+
+    def load_startup_defaults(self):
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r") as f:
+                    saved = json.load(f)
+                    self.startup_settings.update(saved)
+            except:
+                pass
+
+    def save_current_as_default(self):
+        data = self.gather_current_ui_settings()
+        try:
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(data, f, indent=4)
+            messagebox.showinfo("Saved", "Current settings saved as startup default.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save settings: {e}")
+
+    def refresh_presets_list(self):
+        files = glob.glob(os.path.join(PRESETS_DIR, "*.json"))
+        names = [os.path.basename(f).replace(".json", "") for f in files]
+        names.sort()
+        if not names:
+            self.preset_dropdown.configure(values=["No Presets"])
+            self.preset_var.set("No Presets")
+        else:
+            self.preset_dropdown.configure(values=names)
+            self.preset_var.set("Select Preset...")
+
+    def save_new_preset(self):
+        name = simpledialog.askstring("New Preset", "Enter a name for this preset:")
+        if not name: return
+
+        # Sanitize filename
+        safe_name = "".join(x for x in name if x.isalnum() or x in " -_")
+        path = os.path.join(PRESETS_DIR, f"{safe_name}.json")
+
+        data = self.gather_current_ui_settings()
+        try:
+            with open(path, "w") as f:
+                json.dump(data, f, indent=4)
+            self.refresh_presets_list()
+            self.preset_var.set(safe_name)
+            messagebox.showinfo("Success", f"Preset '{safe_name}' saved.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def load_selected_preset(self, choice):
+        if choice == "No Presets" or choice == "Select Preset...": return
+
+        path = os.path.join(PRESETS_DIR, f"{choice}.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                self.apply_settings_dict(data)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load preset: {e}")
+
+    def reset_to_factory(self):
+        if messagebox.askyesno("Confirm", "Reset everything to Factory Defaults?"):
+            self.apply_settings_dict(FACTORY_DEFAULTS)
+
+    # --- MAIN FUNCTIONALITY ---
 
     def select_file(self):
         path = filedialog.askopenfilename(filetypes=[("EPUB", "*.epub")])
@@ -721,6 +1106,18 @@ class App(ctk.CTk):
         self.lbl_top_padding.configure(text=f"Top Padding: {int(value)}px")
         self.schedule_update()
 
+    def update_footer_size_label(self, value):
+        self.lbl_footer_size.configure(text=f"Text Size: {int(value)}")
+        self.schedule_update()
+
+    def update_bar_thick_label(self, value):
+        self.lbl_bar_thick.configure(text=f"Bar Thick: {int(value)}px")
+        self.schedule_update()
+
+    def update_footer_margin_label(self, value):
+        self.lbl_footer_margin.configure(text=f"Footer position: {int(value)}px")
+        self.schedule_update()
+
     def update_progress_ui(self, val, stage_text="Processing"):
         self.after(0, lambda: self.progress_bar.set(val))
         self.after(0, lambda: self.progress_label.configure(text=f"{stage_text}: {int(val * 100)}%"))
@@ -732,13 +1129,25 @@ class App(ctk.CTk):
         if self.selected_chapter_indices is None:
             self.selected_chapter_indices = list(range(len(self.processor.raw_chapters)))
 
+        # Capture current footer config
+        footer_settings = {
+            "footer_visible": self.var_footer_visible.get(),
+            "footer_font_size": int(self.slider_footer_size.get()),
+            "footer_show_progress": self.var_footer_prog.get(),
+            "footer_show_pagenum": self.var_footer_pg.get(),
+            "footer_show_title": self.var_footer_title.get(),
+            "footer_text_pos": self.footer_pos_var.get(),
+            "footer_bar_height": int(self.slider_bar_thick.get()),
+            "footer_bottom_margin": int(self.slider_footer_margin.get())
+        }
+
         self.is_processing = True
         self.btn_run.configure(state="disabled", text="Rendering...", fg_color="orange")
         self.progress_label.configure(text="Starting layout...")
 
-        threading.Thread(target=self._task_render).start()
+        threading.Thread(target=lambda: self._task_render(footer_settings)).start()
 
-    def _task_render(self):
+    def _task_render(self, footer_settings):
         success = self.processor.render_chapters(
             self.selected_chapter_indices,
             self.processor.font_path,
@@ -751,6 +1160,7 @@ class App(ctk.CTk):
             text_align=self.align_dropdown.get(),
             orientation=self.orientation_var.get(),
             add_toc=self.var_toc.get(),
+            footer_settings=footer_settings,
             progress_callback=lambda v: self.update_progress_ui(v, "Layout")
         )
         self.after(0, lambda: self._done(success))
@@ -775,9 +1185,6 @@ class App(ctk.CTk):
         img = self.processor.render_page(idx)
 
         # --- SMART SCALING LOGIC ---
-        # The slider controls the "Short Edge" (e.g. text width) in both orientations
-        # to ensure text remains readable and consistent.
-
         base_size = int(self.slider_preview_zoom.get())
 
         if img.width > img.height:
