@@ -7,12 +7,14 @@ A GUI-based tool designed to convert standard `.epub` files into the `.xtc` bina
 
 ## Main Features
 
+* **Smart Table of Contents:** Automatically generates visual TOC pages that dynamically adapt to your selected font size, line height, and margins.
+* **Chapter Visibility Control:** Non-destructively hide specific chapters from the **Table of Contents** and **Progress Bar** while keeping the text readable in the book.
+* **Dynamic Footer Engine:** Fully customizable bottom area. Toggle the **Progress Bar**, **Page Numbers**, or **Chapter Titles** independently. Supports adjusting text position (Above/Below bar), font size, and bar thickness.
+* **Preset Management:** Save and load your favorite layout configurations via the `presets/` folder. Presets are JSON-based and cross-compatible with the Web version.
+* **Custom Typography:** Drop external `.ttf` or `.otf` files into the `fonts/` directory to use them instantly. Includes sliders for font weight, size, and line height.
 * **Smart Hyphenation:** Uses `pyphen` to inject soft hyphens into text nodes, ensuring proper line breaks and justified text flow.
-* **Table of Contents Generation:** Automatically creates visual TOC pages at the start of the file, linked to specific rendered page numbers.
-* **Visual Progress Bar:** Generates a reading progress bar at the bottom of every page, including indicators for chapter start points.
-* **Custom Typography:** Supports system fonts and external `.ttf` / `.otf` fonts. Allows adjustment of font weight, size, and line height.
 * **Image Optimization:** Automatically extracts, scales, contrast-enhances, and dithers (Floyd-Steinberg) images embedded in the EPUB.
-* **Layout Control:** Configurable margins, top/bottom padding, and text alignment (Justified/Left).
+* **Layout Control:** Configurable margins, top/bottom padding, orientation (Portrait/Landscape), and text alignment (Justified/Left)
 
 ![App Screenshot 1](images/xtc.png)
 ![App Screenshot 2](images/xtc2.png)
