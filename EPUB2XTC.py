@@ -1148,7 +1148,7 @@ class App(ctk.CTk):
         self.startup_settings = FACTORY_DEFAULTS.copy()
         self.load_startup_defaults()
 
-        self.title("EPUB2XTC - Split Layout")
+        self.title("EPUB2XTC")
         self.geometry("1400x1000")
 
         self.grid_columnconfigure(0, weight=0)
@@ -1886,4 +1886,5 @@ class App(ctk.CTk):
 
 if __name__ == "__main__":
     app = App()
+
     app.mainloop()
