@@ -7,14 +7,16 @@ A GUI-based tool designed to convert standard `.epub` files into the `.xtc` bina
 
 ## Main Features
 
-* **Smart Table of Contents:** Automatically generates visual TOC pages that dynamically adapt to your selected font size, line height, and margins.
+* **Smart Table of Contents:** Automatically generates visual TOC pages that dynamically adapt to your selected font size and margins. Now features **robust file mapping** to accurately detect chapter titles even in complex EPUB folder structures.
 * **Chapter Visibility Control:** Non-destructively hide specific chapters from the **Table of Contents** and **Progress Bar** while keeping the text readable in the book.
-* **Dynamic Footer Engine:** Fully customizable bottom area. Toggle the **Progress Bar**, **Page Numbers**, or **Chapter Titles** independently. Supports adjusting text position (Above/Below bar), font size, and bar thickness.
+* **Advanced Header & Footer Engine:** Fully customizable top and bottom areas. Assign elements (**Title**, **Page Number**, **Reading %**, **Chapter Page**) to either the **Header** or **Footer**. Supports custom **ordering** and **alignment** (Left/Center/Right/Justify).
+* **Enhanced Progress Bar:** Visual bar featuring **Chapter Ticks** and a **Current Position Marker**. Can be positioned in the Header or Footer (Above/Below text).
+* **Inline Footnotes:** Automatically detects and renders internal links/footnotes at the bottom of the relevant text block, preventing the need to jump pages to read references.
+* **Cover Export Tool:** Built-in utility to resize, crop, and dither the book cover into a high-quality 1-bit BMP image.
+* **Image Optimization:** Automatically extracts, scales, contrast-enhances, and applies **Floyd-Steinberg dithering** to images for optimal display on e-ink screens.
 * **Preset Management:** Save and load your favorite layout configurations via the `presets/` folder. Presets are JSON-based and cross-compatible with the Web version.
 * **Custom Typography:** Drop external `.ttf` or `.otf` files into the `fonts/` directory to use them instantly. Includes sliders for font weight, size, and line height.
 * **Smart Hyphenation:** Uses `pyphen` to inject soft hyphens into text nodes, ensuring proper line breaks and justified text flow.
-* **Image Optimization:** Automatically extracts, scales, contrast-enhances, and dithers (Floyd-Steinberg) images embedded in the EPUB.
-* **Layout Control:** Configurable margins, top/bottom padding, orientation (Portrait/Landscape), and text alignment (Justified/Left)
 
 ![App Screenshot 1](images/xtc.png)
 ![App Screenshot 2](images/xtc2.png)
@@ -42,24 +44,38 @@ If you have downloaded the [Release version](https://github.com/Rafal-P-Mazur/EP
 
 ## 📖 User Manual
 
-1.  **Load an EPUB:** Click **Select EPUB** in the sidebar. The application will instantly parse the book structure.
-2.  **Select Chapters:** A dialog will automatically appear displaying all detected chapters.
-    * **Uncheck** any chapters you wish to hide from the **Table of Contents** and **Progress Bar**.
+1.  **Load an EPUB:**
+    * Click **Select EPUB** in the **Left Sidebar**. The application will instantly parse the book structure and attempt to detect the cover.
+
+2.  **Select Chapters:**
+    * A dialog will automatically appear displaying all detected chapters.
+    * **Uncheck** any chapters you wish to hide from the **Table of Contents** and **Progress Bar** (e.g., Copyright pages or generic "Section" headers).
     * *Note:* These chapters are **not deleted**; they remain in the book for reading but will not clutter your navigation.
-3.  **Manage Presets:**
+
+3.  **Manage Presets (Left Sidebar):**
     * Use the dropdown menu to load saved layouts from the `presets` folder.
-    * Click **Save New Preset** to store your current configuration as a JSON file in the `presets` directory.
-    * *Tip:* You can drop external preset files (JSON) directly into the `presets` folder to use them.
-4.  **Configure Layout:**
-    * **Fonts:** To use custom fonts, place your `.ttf` or `.otf` files in the `fonts` directory. The app will automatically detect them.
-    * **General Settings:** Adjust Font Size, Weight, Line Height, Margins, and Orientation (Portrait/Landscape).
-    * **Footer Customization:** Fully control the bottom area: toggle the **Progress Bar**, **Page Numbers**, or **Chapter Title**, adjust text position, and set the bar thickness.
-    * *Note:* The preview will **automatically update** after a short delay when settings are changed.
-5.  **Navigate & Preview:**
-    * Use the **< Previous** and **Next >** buttons to flip pages.
-    * Enter a specific number in the **"Go"** input box to jump directly to that page.
+    * Click **Save** to store your current configuration as a new JSON file.
+    * Click **Default** to save the current settings as your startup configuration.
+
+4.  **Configure Layout (Left Sidebar):**
+    * **Structure:** Toggle **"Generate TOC Pages"** or enable **"Inline Footnotes"** (renders footnotes at the bottom of the text block instead of jumping pages).
+    * **Typography:** Select fonts (place `.ttf` or `.otf` files in the `fonts` directory to add more), and adjust Size, Weight, and Line Height.
+    * **Margins:** Fine-tune Side Margins, Top Padding (Header area), and Bottom Padding (Footer area).
+
+5.  **Header & Footer (Right Sidebar):**
+    * **Positioning:** Assign elements (Chapter Title, Page Number, Reading %, Chapter Page) to the **Header**, **Footer**, or **Hidden**.
+    * **Ordering:** Change the numeric order (1–4) to rearrange elements on the line.
+    * **Progress Bar:** Choose to display the bar in the Header or Footer. Toggle **"Show Ticks"** (chapter markers) and **"Show Marker"** (current location dot).
+    * **Alignment:** independently align the Header and Footer text (Left, Center, Right, Justify).
+
+6.  **Navigate & Preview (Center):**
+    * Use the **< Prev** and **Next >** buttons or the **"Go"** input box to navigate pages.
     * Use the **Preview Zoom** slider to resize the image (Smart Scaling automatically optimizes this based on orientation).
-6.  **Export:** Click **Export XTC** to save the final binary file.
+    * *Note:* The preview **automatically updates** after a short delay when settings are changed.
+
+7.  **Export:**
+    * **Export XTC:** Generates the final binary file for the device.
+    * **Export Cover:** Opens a tool to resize, crop, and dither the book cover into a 1-bit BMP image.
    
 ## 📦 Dependencies
 
