@@ -83,6 +83,84 @@ def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
     return css_text
 
 
+def get_font_variants(font_path):
+    """
+    Scans the directory to find sibling files.
+    Robustly separates Bold, Italic, and Bold-Italic using safe keywords.
+    """
+    if not font_path or not os.path.exists(font_path):
+        return {}
+
+    directory = os.path.dirname(font_path)
+
+    try:
+        all_files = [f for f in os.listdir(directory) if f.lower().endswith((".ttf", ".otf"))]
+    except:
+        return {}
+
+    candidates = {
+        "regular": [],
+        "italic": [],
+        "bold": [],
+        "bold_italic": []
+    }
+
+    def check_keywords(name, must_have, must_not_have=[]):
+        name_lower = name.lower()
+        if any(bad in name_lower for bad in must_not_have):
+            return False
+        # Returns True if ANY of the 'must_have' words are present
+        return any(good in name_lower for good in must_have)
+
+    for f in all_files:
+        full_path = os.path.join(directory, f).replace("\\", "/")
+        name_lower = f.lower()
+
+        # KEYWORDS
+        # We use explicit words to avoid matching "Bookerly" as Bold (b) or "Titillium" as Italic (it)
+        has_bold = any(x in name_lower for x in ["bold", "bd"])
+        has_italic = any(x in name_lower for x in ["italic", "oblique", "obl"])
+
+        # 1. BOLD ITALIC (Must have BOTH keywords)
+        # Catches: "Font-BoldItalic.ttf", "Font Bold Italic.ttf", "Font-Bd-Obl.ttf"
+        if has_bold and has_italic:
+            candidates["bold_italic"].append(full_path)
+            continue
+
+        # 2. BOLD (Must have bold, must NOT have italic)
+        if has_bold and not has_italic:
+            candidates["bold"].append(full_path)
+            continue
+
+        # 3. ITALIC (Must have italic, must NOT have bold)
+        if has_italic and not has_bold:
+            candidates["italic"].append(full_path)
+            continue
+
+        # 4. REGULAR (Has neither)
+        candidates["regular"].append(full_path)
+
+    # Pick best match (shortest filename without 'light'/'thin' etc)
+    def pick_best(file_list):
+        if not file_list: return None
+
+        def score(path):
+            fn = os.path.basename(path).lower()
+            s = len(fn)  # shorter is usually better
+            if any(x in fn for x in ["light", "thin", "semi", "medium", "extra", "condensed"]):
+                s += 50  # massive penalty for non-standard weights
+            return s
+
+        return sorted(file_list, key=score)[0]
+
+    return {
+        "regular": font_path.replace("\\", "/"),  # Always use user selection as base
+        "italic": pick_best(candidates["italic"]),
+        "bold": pick_best(candidates["bold"]),
+        "bold_italic": pick_best(candidates["bold_italic"])
+    }
+
+
 def get_pil_font(font_path, size):
     try:
         if font_path and os.path.exists(font_path):
@@ -179,12 +257,41 @@ def get_local_fonts():
         except OSError:
             pass
 
-    fonts = []
+    font_map = {}
+
     if os.path.exists(fonts_dir):
-        for f in os.listdir(fonts_dir):
-            if f.lower().endswith((".ttf", ".otf")):
-                fonts.append(os.path.abspath(os.path.join(fonts_dir, f)))
-    return sorted(fonts)
+        # 1. Scan Subdirectories
+        for item in os.listdir(fonts_dir):
+            item_path = os.path.join(fonts_dir, item)
+            if os.path.isdir(item_path):
+                files = [f for f in os.listdir(item_path) if f.lower().endswith((".ttf", ".otf"))]
+                if not files:
+                    continue
+
+                # LOGIC FIX: Don't just take files[0].
+                # First, try to find a file that is NOT bold and NOT italic.
+                candidates = [f for f in files if "bold" not in f.lower() and "italic" not in f.lower()]
+
+                if candidates:
+                    # If we found neutral files, prefer "regular", "book", or "roman"
+                    main_file = candidates[0]
+                    for f in candidates:
+                        if any(x in f.lower() for x in ["regular", "book", "roman"]):
+                            main_file = f
+                            break
+                else:
+                    # Fallback: If folder only has bold/italic, just take the first one
+                    main_file = files[0]
+
+                font_map[item] = os.path.abspath(os.path.join(item_path, main_file))
+
+        # 2. Scan Root Files
+        for item in os.listdir(fonts_dir):
+            item_path = os.path.join(fonts_dir, item)
+            if os.path.isfile(item_path) and item.lower().endswith((".ttf", ".otf")):
+                font_map[item] = os.path.abspath(item_path)
+
+    return font_map
 
 
 # --- POPUP DIALOG FOR COVER EXPORT ---
@@ -559,13 +666,55 @@ class EpubProcessor:
         for doc, _ in self.fitz_docs: doc.close()
         self.fitz_docs, self.page_map = [], []
 
+        # ### NEW FONT LOGIC STARTS HERE ###
         if self.font_path:
-            css_font_path = self.font_path.replace("\\", "/")
-            font_face_rule = f'@font-face {{ font-family: "CustomFont"; src: url("{css_font_path}"); }}'
+            # 1. Get dictionary of paths (Regular, Italic, Bold, BoldItalic)
+            variants = get_font_variants(self.font_path)
+
+            font_rules = []
+
+            # Rule for REGULAR (Normal/Normal)
+            # We explicitly set font-style: normal so the browser doesn't use this for <i>
+            font_rules.append(f"""@font-face {{ 
+                font-family: "CustomFont"; 
+                src: url("{variants['regular']}"); 
+                font-weight: normal; 
+                font-style: normal; 
+            }}""")
+
+            # Rule for ITALIC
+            if variants['italic']:
+                font_rules.append(f"""@font-face {{ 
+                    font-family: "CustomFont"; 
+                    src: url("{variants['italic']}"); 
+                    font-weight: normal; 
+                    font-style: italic; 
+                }}""")
+
+            # Rule for BOLD
+            if variants['bold']:
+                font_rules.append(f"""@font-face {{ 
+                    font-family: "CustomFont"; 
+                    src: url("{variants['bold']}"); 
+                    font-weight: bold; 
+                    font-style: normal; 
+                }}""")
+
+            # Rule for BOLD ITALIC
+            if variants['bold_italic']:
+                font_rules.append(f"""@font-face {{ 
+                    font-family: "CustomFont"; 
+                    src: url("{variants['bold_italic']}"); 
+                    font-weight: bold; 
+                    font-style: italic; 
+                }}""")
+
+            font_face_rule = "\n".join(font_rules)
             font_family_val = '"CustomFont"'
         else:
             font_face_rule = ""
             font_family_val = "serif"
+        # ### NEW FONT LOGIC ENDS HERE ###
 
         patched_css = fix_css_font_paths(self.book_css, font_family_val)
 
@@ -574,27 +723,45 @@ class EpubProcessor:
                     {font_face_rule}
                     @page {{ size: {self.screen_width}pt {self.screen_height}pt; margin: 0; }}
 
-                    body, p, div, span, li, blockquote, dd, dt {{
+                    /* Global Defaults applied to Body */
+                    body {{
                         font-family: {font_family_val} !important;
                         font-size: {self.font_size}pt !important;
                         font-weight: {self.font_weight} !important;
                         line-height: {self.line_height} !important;
                         text-align: {self.text_align} !important;
                         color: black !important;
-                        overflow-wrap: break-word;
-                    }}
-
-                    body {{
                         margin: 0 !important;
                         padding: {self.margin}px !important;
                         background-color: white !important;
                         width: 100% !important; 
                         height: 100% !important;
+                        overflow-wrap: break-word;
                     }}
 
+                    /* Block elements inherit global settings but enforce alignment */
+                    p, div, li, blockquote, dd, dt {{
+                        font-family: inherit !important;
+                        font-size: inherit !important;
+                        font-weight: inherit !important;
+                        line-height: inherit !important;
+                        text-align: {self.text_align} !important;
+                        color: inherit !important;
+                    }}
+
+                    /* SPAN: Enforce font-family but allow weight/style to be determined by classes */
+                    span {{
+                        font-family: {font_family_val} !important;
+                        font-size: inherit !important;
+                        line-height: inherit !important;
+                        color: inherit !important;
+                    }}
+
+                    /* Fix for images and headers */
                     img {{ max-width: 95% !important; height: auto !important; display: block; margin: 20px auto !important; }}
                     h1, h2, h3 {{ text-align: center !important; margin-top: 1em; font-weight: {min(900, self.font_weight + 200)} !important; }}
 
+                    /* Footnote styling */
                     .fn-marker {{
                         font-weight: bold;
                         font-size: 0.7em !important;
@@ -1231,9 +1398,14 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(row_font, text="Font Family:").pack(side="left")
 
-        self.available_fonts = get_local_fonts()
-        self.font_options = ["Default (System)"] + [os.path.basename(f) for f in self.available_fonts]
-        self.font_map = {os.path.basename(f): f for f in self.available_fonts}
+        self.available_fonts = get_local_fonts()  # This now returns a DICTIONARY
+
+
+
+        self.font_options = ["Default (System)"] + sorted(list(self.available_fonts.keys()))
+
+        # We need to map the Display Name (Key) back to the File Path (Value)
+        self.font_map = self.available_fonts.copy()
         self.font_map["Default (System)"] = "DEFAULT"
 
         self.font_dropdown = ctk.CTkOptionMenu(row_font, values=self.font_options, width=150,
@@ -1886,5 +2058,4 @@ class App(ctk.CTk):
 
 if __name__ == "__main__":
     app = App()
-
     app.mainloop()
