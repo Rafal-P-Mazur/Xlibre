@@ -1,4 +1,5 @@
 import os
+import concurrent.futures
 import sys
 import struct
 import fitz  # PyMuPDF
@@ -978,11 +979,16 @@ class EpubProcessor:
         num_toc = len(self.toc_pages_images)
         footer_padding = max(0, self.bottom_padding)
         header_padding = max(0, self.top_padding)
+
+        # Calculate available height for the actual text content
         content_height = self.screen_height - footer_padding - header_padding
+        if content_height < 1: content_height = 1  # Safety
 
         # --- STEP A: PREPARE CONTENT LAYER ---
         has_image_content = False
+
         if global_page_index < num_toc:
+            # Table of Contents (Pre-rendered)
             img_content = self.toc_pages_images[global_page_index].copy().convert("L")
             is_toc = True
         else:
@@ -990,48 +996,77 @@ class EpubProcessor:
             doc_idx, page_idx = self.page_map[global_page_index - num_toc]
             doc, has_image_content = self.fitz_docs[doc_idx]
             page = doc[page_idx]
-            mat = fitz.Matrix(DEFAULT_RENDER_SCALE, DEFAULT_RENDER_SCALE)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_content_raw = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            img_content = img_content_raw.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert(
-                "L")
 
+            # --- OPTIMIZATION START ---
+            # Calculate the exact matrix to fit the target area
+            # This replaces rendering at 3.0x and resizing with Lanczos
+            src_w = page.rect.width
+            src_h = page.rect.height
+
+            # scaling factors
+            sx = self.screen_width / src_w
+            sy = content_height / src_h
+
+            # Use PyMuPDF to render exactly at target size (Fast C++ rendering)
+            mat = fitz.Matrix(sx, sy)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
+            # Create PIL image from bytes (Zero-copy if possible, or fast copy)
+            img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
+            # --- OPTIMIZATION END ---
+
+        # Create canvas
         full_page = Image.new("L", (self.screen_width, self.screen_height), 255)
         paste_y = 0 if is_toc else header_padding
-        full_page.paste(img_content, (0, paste_y))
+
+        # Determine Paste coordinates (Center horizontally if slight mismatch)
+        paste_x = (self.screen_width - img_content.width) // 2
+        full_page.paste(img_content, (paste_x, paste_y))
 
         # --- STEP B: APPLY FILTERS ---
         if not is_toc:
-            # If we are in Threshold mode but the page has an image,
-            # use the fixed dither settings requested.
-            if mode == "Threshold" and has_image_content:
-                full_page = ImageEnhance.Contrast(full_page).enhance(1.2)
-                full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
-
-            elif mode == "Dither":
-                # Standard Dither logic (uses the UI sliders)
+            # 1. DITHER MODE
+            if mode == "Dither":
                 if contrast != 1.0:
                     full_page = ImageEnhance.Contrast(full_page).enhance(contrast)
-                full_page = full_page.point(lambda p: 255 if p > white_clip else p)
+
+                # Apply White Clip (Optimized lookup)
+                if white_clip < 255:
+                    full_page = full_page.point(lambda p: 255 if p > white_clip else p)
+
+                # Floyd-Steinberg Dithering
                 full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
 
+            # 2. THRESHOLD MODE
             else:
-                # Standard Threshold pipeline (Text only)
-                enhancer = ImageEnhance.Sharpness(full_page)
-                apply_sharp = 1.0 + (sharpness_val * 0.5)
-                full_page = enhancer.enhance(apply_sharp)
-                full_page = full_page.point(lambda p: 255 if p > threshold_val else 0).convert("L")
+                # If page has images, we might want Dither even in Threshold mode
+                # (Optional logic, sticking to your default logic here)
+                if has_image_content:
+                    # Simple contrast boost for mixed content
+                    full_page = ImageEnhance.Contrast(full_page).enhance(1.2)
+                    full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+                else:
+                    # Pure Text Optimization
+                    if sharpness_val > 0:
+                        enhancer = ImageEnhance.Sharpness(full_page)
+                        full_page = enhancer.enhance(1.0 + (sharpness_val * 0.5))
+
+                    # Fast Thresholding
+                    full_page = full_page.point(lambda p: 255 if p > threshold_val else 0).convert("L")
 
         # --- STEP C: UI OVERLAY ---
+        # Convert to RGB only for the colored UI drawing
         img_final = full_page.convert("RGB")
         draw = ImageDraw.Draw(img_final)
 
         if not is_toc:
+            # Mask Header/Footer areas with White before drawing text
             if header_padding > 0:
                 draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
             if footer_padding > 0:
                 draw.rectangle([0, self.screen_height - footer_padding, self.screen_width, self.screen_height],
                                fill=(255, 255, 255))
+
             self._draw_header(draw, global_page_index)
             self._draw_footer(draw, global_page_index)
 
@@ -1039,20 +1074,82 @@ class EpubProcessor:
 
     def save_xtc(self, out_name, progress_callback=None):
         if not self.is_ready: return
-        blob, idx = bytearray(), bytearray()
-        data_off = 56 + (16 * self.total_pages)
-        for i in range(self.total_pages):
-            if progress_callback: progress_callback((i + 1) / self.total_pages)
-            img_rgb = self.render_page(i)
+
+        # Prepare headers
+        blob_accumulator = []
+        idx_accumulator = []
+
+        # Offset calculation
+        # Header (56 bytes) + Index Entries (16 bytes * total_pages)
+        data_off_start = 56 + (16 * self.total_pages)
+        current_data_offset = data_off_start
+
+        # --- HELPER WORKER FUNCTION ---
+        def process_page_worker(page_index):
+            # Render
+            img_rgb = self.render_page(page_index)
             img_final = img_rgb.convert("1")
             w, h = img_final.size
-            xtg = struct.pack("<IHHBBIQ", 0x00475458, w, h, 0, 0, ((w + 7) // 8) * h, 0) + img_final.tobytes()
-            idx.extend(struct.pack("<QIHH", data_off + len(blob), len(xtg), w, h))
-            blob.extend(xtg)
-        header = struct.pack("<IHHBBBBIQQQQQ", 0x00435458, 0x0100, self.total_pages, 0, 0, 0, 0, 0, 0, 56, data_off, 0,
-                             0)
+
+            # Create XTC Page Block
+            # 0x00475458 = 'XTG\0'
+            img_bytes = img_final.tobytes()
+            xtg_header = struct.pack("<IHHBBIQ",
+                                     0x00475458,
+                                     w, h,
+                                     0, 0,
+                                     ((w + 7) // 8) * h,  # Stride/Size calc
+                                     0)
+
+            full_page_blob = xtg_header + img_bytes
+            return full_page_blob, w, h
+
+        # --- PARALLEL EXECUTION ---
+        # Using ThreadPoolExecutor because PyMuPDF fitz.Document isn't easily pickle-able
+        # for ProcessPool, but fits handles threading reasonably well for reading.
+        max_workers = os.cpu_count()
+        results = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all pages
+            future_to_page = {executor.submit(process_page_worker, i): i for i in range(self.total_pages)}
+
+            # Process results as they complete, but we need to store them in ORDER
+            # So we use map, or just sort results later. Map is cleaner.
+            pass
+
+            # Map preserves order
+            for i, result in enumerate(executor.map(process_page_worker, range(self.total_pages))):
+                if progress_callback:
+                    progress_callback((i + 1) / self.total_pages)
+
+                page_blob, w, h = result
+                blob_size = len(page_blob)
+
+                # Build Index Entry
+                # Offset (Q), Size (I), Width (H), Height (H)
+                idx_entry = struct.pack("<QIHH", current_data_offset, blob_size, w, h)
+
+                idx_accumulator.append(idx_entry)
+                blob_accumulator.append(page_blob)
+
+                current_data_offset += blob_size
+
+        # --- WRITE FILE ---
+        # Header: 'XTX\0' (0x00435458), Version 0x0100
+        header = struct.pack("<IHHBBBBIQQQQQ",
+                             0x00435458, 0x0100, self.total_pages,
+                             0, 0, 0, 0, 0, 0,
+                             56,  # Offset to Index
+                             data_off_start,  # Offset to Data
+                             0, 0)
+
         with open(out_name, "wb") as f:
-            f.write(header + idx + blob)
+            f.write(header)
+            for idx_chunk in idx_accumulator:
+                f.write(idx_chunk)
+            for blob_chunk in blob_accumulator:
+                f.write(blob_chunk)
 
 
 class App(ctk.CTk):
