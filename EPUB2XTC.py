@@ -1,5 +1,4 @@
 import os
-import concurrent.futures
 import sys
 import struct
 import fitz  # PyMuPDF
@@ -17,6 +16,25 @@ import json
 import glob
 import io
 from urllib.parse import unquote
+import time
+import hashlib
+import csv  # Added for AoA parsing
+import tempfile
+
+# --- OPTIONAL DEPENDENCIES ---
+try:
+    import wordfreq
+
+    HAS_WORDFREQ = True
+except ImportError:
+    HAS_WORDFREQ = False
+
+try:
+    from openai import OpenAI
+
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
 
 # --- CONFIGURATION DEFAULTS ---
 DEFAULT_SCREEN_WIDTH = 480
@@ -34,9 +52,18 @@ FACTORY_DEFAULTS = {
     "orientation": "Portrait",
     "text_align": "justify",
     "font_name": "Default (System)",
-    "preview_zoom": 300,
+    "preview_zoom": 440,
     "generate_toc": True,
     "show_footnotes": False,
+
+    # --- SPECTRA AI ANNOTATIONS ---
+    "spectra_enabled": False,
+    "spectra_threshold": 3.8,  # Zipf score
+    "spectra_aoa_threshold": 10.0,  # NEW: AoA Threshold (0 = disabled)
+    "spectra_api_key": "",
+    "spectra_base_url": "https://api.openai.com/v1",
+    "spectra_model": "gpt-4o-mini",
+    "spectra_language": "en",
 
     # --- ELEMENT VISIBILITY & POSITION ---
     "pos_title": "Footer",
@@ -44,7 +71,7 @@ FACTORY_DEFAULTS = {
     "pos_chap_page": "Hidden",
     "pos_percent": "Hidden",
 
-    # --- ELEMENT ORDERING (Lower number = Left/First) ---
+    # --- ELEMENT ORDERING ---
     "order_pagenum": 1,
     "order_title": 2,
     "order_chap_page": 3,
@@ -61,30 +88,369 @@ FACTORY_DEFAULTS = {
     "bar_show_ticks": True,
     "bar_tick_height": 6,
 
-    # --- HEADER STYLING ---
+    # --- HEADER/FOOTER STYLING ---
     "header_font_size": 16,
     "header_align": "Center",
     "header_margin": 10,
-
-    # --- FOOTER STYLING ---
     "footer_font_size": 16,
     "footer_align": "Center",
     "footer_margin": 10,
 
     # --- RENDER MODES ---
+    "bit_depth": "1-bit (XTG)",
     "render_mode": "Threshold",
-
-    # Dither Settings (Also used for Images in Threshold mode)
     "white_clip": 220,
     "contrast": 1.2,
-
-    # Threshold Settings (Text Only)
     "text_threshold": 130,
     "text_blur": 1.0,
 }
 
-SETTINGS_FILE = "default_settings.json"
-PRESETS_DIR = "presets"
+
+if getattr(sys, 'frozen', False):
+    # Running as compiled PyInstaller executable
+    EXTERNAL_DIR = os.path.dirname(sys.executable) # Outside the .exe (User can see/edit)
+    INTERNAL_DIR = sys._MEIPASS                    # Inside the .exe (Hidden, read-only)
+else:
+    # Running as a standard Python script
+    EXTERNAL_DIR = os.path.dirname(os.path.abspath(__file__))
+    INTERNAL_DIR = EXTERNAL_DIR
+
+# --- EXTERNAL FILES (User can edit these or drop files here) ---
+SETTINGS_FILE = os.path.join(EXTERNAL_DIR, "default_settings.json")
+PRESETS_DIR = os.path.join(EXTERNAL_DIR, "presets")
+
+# --- INTERNAL FILES (Bundled inside the .exe so you don't have to distribute them) ---
+AOA_FILE = os.path.join(INTERNAL_DIR, "AoA_51715_words.csv")
+
+# Global AoA Database
+AOA_DB = {}
+
+def load_aoa_database():
+    """Loads the Kuperman AoA CSV into a global dict."""
+    global AOA_DB
+    if not os.path.exists(AOA_FILE):
+        print(f"AoA file not found: {AOA_FILE}")
+        return
+
+    try:
+        with open(AOA_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.DictReader(f)
+
+            # Check required columns
+            # Note: We now look for the lemmatized column as a fallback
+            if 'Word' not in reader.fieldnames:
+                print("AoA CSV missing 'Word' column.")
+                return
+
+            count = 0
+            for row in reader:
+                word = row['Word'].strip().lower()
+
+                # 1. Try exact word AoA first
+                val = row.get('AoA_Kup')
+
+                # 2. If empty, try Lemmatized AoA (Fallback for plurals like 'dinners')
+                if not val or val.lower() == 'na':
+                    val = row.get('AoA_Kup_lem')
+
+                try:
+                    if val and val.lower() != 'na':
+                        AOA_DB[word] = float(val)
+                        count += 1
+                except ValueError:
+                    continue
+
+            print(f"Loaded {count} words from AoA database.")
+    except Exception as e:
+        print(f"Error loading AoA CSV: {e}")
+
+
+# --- SPECTRA ANNOTATOR CLASS (PHRASE AWARE) ---
+class SpectraAnnotator:
+    def __init__(self, api_key, base_url, model, threshold=4.0, aoa_threshold=0.0, language='en',
+                 target_lang='English'):
+        self.enabled = HAS_WORDFREQ and HAS_OPENAI and bool(api_key)
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+        self.threshold = threshold  # Zipf Threshold (Upper bound)
+        self.aoa_threshold = aoa_threshold  # AoA Threshold (Lower bound)
+        self.language = language
+        self.target_lang = target_lang
+        self.client = None
+        # Cache Key: "word|context_hash" -> Value: "Definition"
+        self.master_cache = {}
+
+        if self.enabled:
+            try:
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            except Exception as e:
+                print(f"Spectra Init Error: {e}")
+                self.enabled = False
+
+    def get_difficulty(self, word):
+        if not HAS_WORDFREQ: return 10.0
+        return wordfreq.zipf_frequency(word, self.language)
+
+    def get_aoa(self, word):
+        """Returns Age of Acquisition or 0 if not found."""
+        return AOA_DB.get(word, 0.0)
+
+    def fetch_definitions_batch(self, word_context_map, force=False):
+        if not word_context_map or not self.client: return {}
+
+        # Determine what to fetch (all or only missing)
+        if force:
+            to_fetch = word_context_map
+        else:
+            to_fetch = {k: ctx for k, ctx in word_context_map.items() if k not in self.master_cache}
+
+        if not to_fetch: return {}
+
+        # 1. BUILD THE BATCH LIST
+        items_str = ""
+        for unique_key, context in to_fetch.items():
+            target_word = unique_key.split('|')[0]
+            clean_context = context.replace('"', "'").replace('\n', ' ').strip()[:300]
+            items_str += (
+                f"ID: {unique_key}\n"
+                f"WORD: {target_word}\n"
+                f"CONTEXT: {clean_context}\n"
+                f"---\n"
+            )
+
+        # 2. DEFINE THE OUTPUT SCHEMA (JSON)
+        json_schema = {
+            "name": "dictionary_response",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "definition": {"type": "string"}
+                            },
+                            "required": ["id", "definition"],
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "required": ["entries"],
+                "additionalProperties": False
+            }
+        }
+        # Map your UI dropdown names to standard EPUB 2-letter codes
+        lang_map = {
+            "English": "en", "Spanish": "es", "French": "fr",
+            "German": "de", "Italian": "it", "Polish": "pl",
+            "Portuguese": "pt", "Russian": "ru", "Chinese": "zh", "Japanese": "ja"
+        }
+
+        # Get the 2-letter code for the selected target (fallback to 'en' if not found)
+        target_code = lang_map.get(self.target_lang, "en")
+
+        # Get the 2-letter code of the book itself (slicing [:2] handles "en-US" or "en-GB")
+        book_code = self.language.lower()[:2]
+
+        # It's a translation if the codes don't match!
+        is_translation = (target_code != book_code)
+
+        if is_translation:
+            task_instruction = f"TASK: TRANSLATE 'WORD' accurately into {self.target_lang} based on the 'CONTEXT'."
+            # Added back the anti-generalization rule to prevent "crossbow" -> "bow"
+            rule_1 = "1. Provide the exact, literal translation. Do NOT simplify or generalize physical objects."
+            # Define grammar_rule here so Python doesn't crash!
+            grammar_rule = "4. Output the word in its base dictionary form (nominative/infinitive)."
+        else:
+            task_instruction = f"TASK: Provide a direct, simpler SYNONYM for 'WORD' in {self.target_lang} that fits the 'CONTEXT'."
+            rule_1 = "1. The synonym must be easier to understand but MUST preserve the exact nuance."
+            # Define grammar_rule here for English-to-English replacements
+            grammar_rule = "4. Match the grammatical form (plural, past tense, -ing, etc.) of the original word perfectly so it can directly replace it in the sentence."
+
+        prompt = (
+            f"{task_instruction}\n"
+            f"RULES:\n"
+            f"{rule_1}\n"
+            f"2. Do NOT simply describe what is happening; output the direct replacement word itself.\n"
+            f"3. Keep responses extremely short (1-2 words maximum).\n"
+            f"{grammar_rule}\n"
+            f"5. Output valid JSON.\n"
+            f"\n"
+            f"INPUT LIST:\n"
+            f"{items_str}"
+        )
+
+        try:
+            # 4. SEND TO API
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": f"You are a dictionary. Output JSON only. You answer only in {self.target_lang}, regardless of the input language."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": json_schema
+                },
+                temperature=0.2
+            )
+
+            # 5. PROCESS RESPONSE
+            content = response.choices[0].message.content.strip()
+
+            data = {}
+            try:
+                # Try standard JSON parsing first
+                clean = re.sub(r'^```json\s*', '', content)
+                clean = re.sub(r'\s*```$', '', clean)
+                data = json.loads(clean)
+            except json.JSONDecodeError:
+                # --- ROBUST FALLBACK FOR GEMMA/SMALL MODELS ---
+
+                pattern = r'"id":\s*"([^"]+)",\s*"definition":\s*"([^"]+)"'
+                matches = re.findall(pattern, content)
+                if matches:
+                    data = {"entries": [{"id": m[0], "definition": m[1]} for m in matches]}
+
+            if "entries" in data and isinstance(data["entries"], list):
+                for entry in data["entries"]:
+                    key = entry.get("id")
+                    val = entry.get("definition")
+                    if key and val and key in to_fetch:
+
+                        # --- NEW: Sanitize the AI output ---
+                        # 1. Strip whitespace and remove trailing punctuation
+                        clean_val = val.strip().rstrip('.,;!')
+
+                        # 2. Preserve capitalization for German nouns, lowercase everything else
+                        if self.target_lang != "German":
+                            clean_val = clean_val.lower()
+
+                        self.master_cache[key] = clean_val
+
+        except Exception as e:
+            print(f"Spectra API Error: {e}")
+
+    def analyze_chapters(self, chapters_list, selected_indices, progress_callback=None, force=False):
+        if not self.enabled: return
+
+        word_pattern = re.compile(r'\b[a-zA-Z]{3,}\b')
+        split_pattern = r'(?<!\bMr)(?<!\bMrs)(?<!\bDr)(?<!\bMs)(?<!\bSt)(?<!\bProf)(?<!\bCapt)(?<!\bGen)(?<!\bSen)(?<!\bRev)(?<=[.!?])\s+'
+
+        # We accumulate all unique instances here
+        batch_items = {}
+
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            if progress_callback: progress_callback(0.1 + (i / total) * 0.4)
+
+            soup = chapters_list[idx]['soup']
+            full_text = soup.get_text(" ", strip=True)
+            sentences = re.split(split_pattern, full_text)
+
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence: continue
+
+                # Generate a short hash of the sentence context
+                ctx_hash = hashlib.md5(sentence.encode('utf-8')).hexdigest()[:6]
+
+                for match in word_pattern.finditer(sentence):
+                    word_val = match.group()
+                    start_index = match.start()
+
+                    # --- DEFINITION MUST BE HERE (Before the filter) ---
+                    w_lower = word_val.lower()
+                    # ---------------------------------------------------
+
+                    # --- SMART PROPER NOUN FILTER ---
+                    if word_val[0].isupper():
+                        # 1. If in middle of sentence, it's a Name/Place -> Skip
+                        if start_index > 0:
+                            continue
+
+                        # 2. If at start, check if it's a known common word (using AoA DB)
+                        # Priority 1: Check your CSV database
+                        is_known = False
+                        if AOA_DB and w_lower in AOA_DB:
+                            is_known = True
+                        # Priority 2: Fallback to WordFreq if CSV missing
+                        elif not AOA_DB and HAS_WORDFREQ:
+                            if wordfreq.zipf_frequency(w_lower, self.language) > 1.0:
+                                is_known = True
+
+                        # If it's a start-of-sentence Capital but NOT a known word -> Skip
+                        if not is_known:
+                            continue
+                    # --------------------------------
+
+                    # --- DUAL SLIDER LOGIC ---
+                    zipf_score = self.get_difficulty(w_lower)
+
+                    # 1. Zipf Check (Must be RARER than threshold)
+                    is_candidate = (1.5 < zipf_score < self.threshold)
+
+                    # 2. AoA Check (Only if enabled)
+                    if is_candidate and self.aoa_threshold > 0.5 and self.language == 'en':
+                        aoa_val = self.get_aoa(w_lower)
+                        if aoa_val > 0:
+                            # If word has AoA data, it must be OLDER than the slider
+                            if aoa_val < self.aoa_threshold:
+                                is_candidate = False
+
+                    if is_candidate:
+                        unique_key = f"{w_lower}|{ctx_hash}"
+                        if force or unique_key not in self.master_cache:
+                            batch_items[unique_key] = sentence
+
+        # Process Batch
+        if batch_items:
+            items = list(batch_items.items())
+
+            # Dynamically adjust limits based on the Base URL
+            is_local = "localhost" in self.base_url or "127.0.0.1" in self.base_url
+
+            batch_size = 15 if is_local else 40
+            sleep_time = 0.1 if is_local else 4.5
+
+            total_batches = (len(items) + batch_size - 1) // batch_size
+
+            for b_idx, i in enumerate(range(0, len(items), batch_size)):
+                if progress_callback:
+                    pct = 0.5 + (b_idx / total_batches) * 0.5
+                    progress_callback(pct)
+
+                batch = dict(items[i:i + batch_size])
+                self.fetch_definitions_batch(batch, force=force)
+
+                time.sleep(sleep_time)
+
+    def get_ordered_annotations(self, soup):
+        if not self.master_cache: return {}
+        ordered_defs = {}
+        full_text = soup.get_text(" ", strip=True)
+        split_pattern = r'(?<!\bMr)(?<!\bMrs)(?<!\bDr)(?<!\bMs)(?<!\bSt)(?<!\bProf)(?<!\bCapt)(?<!\bGen)(?<!\bSen)(?<!\bRev)(?<=[.!?])\s+'
+        sentences = re.split(split_pattern, full_text)
+        word_pattern = re.compile(r'\b[a-zA-Z]{3,}\b')
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence: continue
+            ctx_hash = hashlib.md5(sentence.encode('utf-8')).hexdigest()[:6]
+
+            matches = word_pattern.findall(sentence)
+            for w in matches:
+                w_lower = w.lower()
+                unique_key = f"{w_lower}|{ctx_hash}"
+                if unique_key in self.master_cache:
+                    if w_lower not in ordered_defs:
+                        ordered_defs[w_lower] = []
+                    ordered_defs[w_lower].append(self.master_cache[unique_key])
+        return ordered_defs
 
 
 # --- UTILITY FUNCTIONS ---
@@ -211,7 +577,7 @@ def hyphenate_html_text(soup, language_code):
             return soup
     word_pattern = re.compile(r'\w+', re.UNICODE)
     for text_node in soup.find_all(string=True):
-        if text_node.parent.name in ['script', 'style', 'head', 'title', 'meta']: continue
+        if text_node.parent.name in ['script', 'style', 'head', 'title', 'meta', 'rt']: continue
         if not text_node.strip(): continue
         original_text = str(text_node)
         clean_text = original_text.replace('\u00A0', ' ')
@@ -255,6 +621,7 @@ def get_local_fonts():
     return font_map
 
 
+# --- DIALOG CLASSES ---
 class CoverExportDialog(ctk.CTkToplevel):
     def __init__(self, parent, callback):
         super().__init__(parent)
@@ -280,7 +647,7 @@ class CoverExportDialog(ctk.CTkToplevel):
         ctk.CTkOptionMenu(self, variable=self.mode_var, values=modes).pack(pady=5)
         ctk.CTkLabel(self,
                      text="Crop to Fill: Fills the screen, cuts off edges if ratio differs.\nFit: Keeps entire image, adds white bars.\nStretch: Forces image to size, may look squashed.",
-                     font=("Arial", 11), text_color="gray").pack(pady=10)
+                     font=("Arial", 12), text_color="gray").pack(pady=10)
         ctk.CTkButton(self, text="Export", command=self.confirm).pack(pady=20)
 
     def confirm(self):
@@ -341,6 +708,7 @@ class ChapterSelectionDialog(ctk.CTkToplevel):
         self.callback(selected_indices)
 
 
+# --- EPUB PROCESSOR ---
 class EpubProcessor:
     def __init__(self):
         self.input_file = ""
@@ -368,6 +736,7 @@ class EpubProcessor:
         self.toc_items_per_page = 18
         self.is_ready = False
         self.global_id_map = {}
+        self.annotator = None  # Instance of SpectraAnnotator
 
     def _split_html_by_toc(self, soup, toc_entries):
         chunks = []
@@ -521,20 +890,35 @@ class EpubProcessor:
         self.input_file = input_path
         self.raw_chapters = []
         self.cover_image_obj = None
+
         try:
             book = epub.read_epub(self.input_file)
         except Exception as e:
             print(f"Error reading EPUB: {e}")
             return False
-        self.cover_image_obj = self._find_cover_image(book)
-        self.global_id_map = self._build_global_id_map(book)
+
+        # --- CAPTURE METADATA FOR XTC EXPORT ---
         try:
-            self.book_lang = book.get_metadata('DC', 'language')[0][0]
-        except:
+            # Extract Title
+            titles = book.get_metadata('DC', 'title')
+            self.title_metadata = titles[0][0] if titles else "Unknown Title"
+
+            # Extract Author
+            authors = book.get_metadata('DC', 'creator')
+            self.author_metadata = authors[0][0] if authors else "Unknown Author"
+
+            # Extract Language
+            langs = book.get_metadata('DC', 'language')
+            self.book_lang = langs[0][0] if langs else 'en'
+        except Exception as e:
+            print(f"Metadata extraction error: {e}")
+            self.title_metadata = "Unknown Title"
+            self.author_metadata = "Unknown Author"
             self.book_lang = 'en'
         self.book_images = extract_images_to_base64(book)
         self.book_css = extract_all_css(book)
         toc_mapping = get_official_toc_mapping(book)
+        self.global_id_map = self._build_global_id_map(book)
         items = [book.get_item_with_id(item_ref[0]) for item_ref in book.spine if
                  isinstance(book.get_item_with_id(item_ref[0]), epub.EpubHtml)]
         for item in items:
@@ -564,27 +948,85 @@ class EpubProcessor:
                     {'title': chapter_title, 'soup': soup, 'has_image': has_image, 'filename': item_filename})
         return True
 
+    def init_annotator(self, layout_settings):
+        target_lang = layout_settings.get("spectra_target_lang", "English")
+        new_api_key = layout_settings.get("spectra_api_key", "")
+        new_base_url = layout_settings.get("spectra_base_url", "")
+        new_model = layout_settings.get("spectra_model", "gpt-4o-mini")
+
+        # Only re-init if needed, else update settings
+        if not self.annotator:
+            self.annotator = SpectraAnnotator(
+                api_key=new_api_key,
+                base_url=new_base_url,
+                model=new_model,
+                threshold=layout_settings.get("spectra_threshold", 4.0),
+                aoa_threshold=layout_settings.get("spectra_aoa_threshold", 0.0),
+                language=self.book_lang,
+                target_lang=target_lang
+            )
+        else:
+            # Update settings on existing instance
+            self.annotator.api_key = new_api_key
+            self.annotator.base_url = new_base_url
+            self.annotator.model = new_model
+            self.annotator.threshold = layout_settings.get("spectra_threshold", 4.0)
+            self.annotator.aoa_threshold = layout_settings.get("spectra_aoa_threshold", 0.0)
+            self.annotator.target_lang = target_lang
+
+            # Re-initialize the OpenAI client with the NEW URL
+            if self.annotator.api_key:
+                try:
+                    self.annotator.client = OpenAI(
+                        api_key=self.annotator.api_key,
+                        base_url=self.annotator.base_url
+                    )
+                    self.annotator.enabled = True
+                except Exception as e:
+                    print(f"Client Init Error: {e}")
+                    self.annotator.enabled = False
+
     def render_chapters(self, selected_indices, font_path, font_size, margin, line_height, font_weight, bottom_padding,
                         top_padding, text_align="justify", orientation="Portrait", add_toc=True, show_footnotes=True,
                         layout_settings=None, progress_callback=None):
         self.font_path = font_path if font_path != "DEFAULT" else ""
         self.font_size = font_size
         self.margin = margin
-        self.line_height = line_height
         self.font_weight = font_weight
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
         self.layout_settings = layout_settings if layout_settings else {}
+
+        # Force comfortable line height if Spectra is enabled
+        spectra_enabled = self.layout_settings.get("spectra_enabled", False)
+        if spectra_enabled:
+            self.line_height = max(line_height, 2.2)
+        else:
+            self.line_height = line_height
+
+        # Orientation logic
         if orientation == "Landscape":
             self.screen_width = DEFAULT_SCREEN_HEIGHT
             self.screen_height = DEFAULT_SCREEN_WIDTH
         else:
             self.screen_width = DEFAULT_SCREEN_WIDTH
             self.screen_height = DEFAULT_SCREEN_HEIGHT
-        for doc, _ in self.fitz_docs: doc.close()
-        self.fitz_docs, self.page_map = [], []
 
+        # Reset docs and maps
+        for entry in self.fitz_docs:
+            entry[0].close()
+        self.fitz_docs = []  # Stores (doc, has_image)
+        self.page_map = []  # Maps global_index -> (doc_index, page_index)
+
+        # NEW: Stores definitions specific to coordinates on a specific page
+        # Key: (doc_index, page_index), Value: { "x_y": "Definition Text" }
+        self.page_annotation_data = {}
+
+        # Init Annotator (for retrieval)
+        self.init_annotator(self.layout_settings)
+
+        # CSS Generation
         if self.font_path:
             variants = get_font_variants(self.font_path)
             font_rules = []
@@ -601,7 +1043,9 @@ class EpubProcessor:
         else:
             font_face_rule = ""
             font_family_val = "serif"
+
         patched_css = fix_css_font_paths(self.book_css, font_family_val)
+
         custom_css = f"""
                 <style>
                     {font_face_rule}
@@ -646,35 +1090,116 @@ class EpubProcessor:
                     .inline-footnote-box p {{ margin: 0 !important; padding: 0 !important; font-size: inherit !important; display: inline; }}
                 </style>
                 """
+
         temp_chapter_starts = []
         running_page_count = 0
-        render_dir = os.path.dirname(self.input_file)
-        temp_html_path = os.path.join(render_dir, "render_temp.html")
+        render_dir = tempfile.gettempdir()
+        temp_html_path = os.path.join(render_dir, f"render_temp_{int(time.time())}.html")
         final_toc_titles = []
         total_chaps = len(self.raw_chapters)
         selected_set = set(selected_indices)
+
+        # Regex for queue building (MUST match the analyzer logic)
+        split_pattern = r'(?<!\bMr)(?<!\bMrs)(?<!\bDr)(?<!\bMs)(?<!\bSt)(?<!\bProf)(?<!\bCapt)(?<!\bGen)(?<!\bSen)(?<!\bRev)(?<=[.!?])\s+'
+        word_pattern = re.compile(r'\b[a-zA-Z]{3,}\b')
+
         for idx, chapter in enumerate(self.raw_chapters):
             if progress_callback: progress_callback((idx / total_chaps) * 0.9)
-            soup = chapter['soup']
-            if show_footnotes: soup = self._inject_inline_footnotes(soup, chapter.get('filename', ''))
+
+            import copy
+            soup = copy.copy(chapter['soup'])
+
+            if show_footnotes:
+                soup = self._inject_inline_footnotes(soup, chapter.get('filename', ''))
+
+            # --- BUILD ANNOTATION QUEUES (FIFO) ---
+            # structure: { "bank": ["Definition 1 (river)", "Definition 2 (finance)"] }
+            annotation_queues = {}
+
+            if spectra_enabled and idx in selected_set and self.annotator and self.annotator.master_cache:
+                full_text = soup.get_text(" ", strip=True)
+                sentences = re.split(split_pattern, full_text)
+
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if not sentence: continue
+
+                    # 1. Recreate the unique context hash
+                    ctx_hash = hashlib.md5(sentence.encode('utf-8')).hexdigest()[:6]
+
+                    # 2. Find words and check if they exist in cache with this hash
+                    matches = word_pattern.findall(sentence)
+                    for w in matches:
+                        w_lower = w.lower()
+                        unique_key = f"{w_lower}|{ctx_hash}"
+
+                        if unique_key in self.annotator.master_cache:
+                            if w_lower not in annotation_queues:
+                                annotation_queues[w_lower] = []
+                            annotation_queues[w_lower].append(self.annotator.master_cache[unique_key])
+
+            # Process Images
             for img_tag in soup.find_all('img'):
                 src = os.path.basename(img_tag.get('src', ''))
                 if src in self.book_images: img_tag['src'] = self.book_images[src]
+
             soup = hyphenate_html_text(soup, self.book_lang)
+
             if idx in selected_set:
                 temp_chapter_starts.append(running_page_count)
                 final_toc_titles.append(chapter['title'])
+
             body_content = "".join([str(x) for x in soup.body.contents]) if soup.body else str(soup)
             final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
+
             with open(temp_html_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
+
+            # --- RENDER PDF ---
             doc = fitz.open(temp_html_path)
             rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
             doc.layout(rect=rect)
+
+            # Save doc reference
             self.fitz_docs.append((doc, chapter['has_image']))
-            for i in range(len(doc)): self.page_map.append((len(self.fitz_docs) - 1, i))
+            current_doc_idx = len(self.fitz_docs) - 1
+
+            # --- ASSIGN DEFINITIONS TO COORDINATES ---
+            # Iterate through generated pages and "deal out" definitions from our queues
+            for page_i, page in enumerate(doc):
+                # This dict will hold mappings for THIS SPECIFIC page
+                page_defs = {}
+
+                # Extract words to match against our queue
+                words_on_page = page.get_text("words")
+
+                for *coords, text, block_n, line_n, word_n in words_on_page:
+                    # Clean the word (remove punctuation, lower case) to match queue keys
+                    clean_text = text.strip('.,!?;:"()[]{}“”').lower()
+
+                    if clean_text in annotation_queues:
+                        queue = annotation_queues[clean_text]
+                        if queue:
+                            # FIFO: Pop the next definition available for this word
+                            definition = queue.pop(0)
+
+                            # Create a unique key based on coordinates
+                            # We use int() to avoid float micro-differences
+                            coord_key = f"{int(coords[0])}_{int(coords[1])}"
+                            page_defs[coord_key] = definition
+
+                # Store the result for render_page to use later
+                if page_defs:
+                    self.page_annotation_data[(current_doc_idx, page_i)] = page_defs
+
+                # Map global page index
+                self.page_map.append((current_doc_idx, page_i))
+
             running_page_count += len(doc)
+
         if os.path.exists(temp_html_path): os.remove(temp_html_path)
+
+        # TOC Generation
         if add_toc and final_toc_titles:
             toc_main_size = self.font_size
             toc_header_size = int(self.font_size * 1.2)
@@ -692,6 +1217,7 @@ class EpubProcessor:
         else:
             self.toc_data_final = [(t, temp_chapter_starts[i] + 1) for i, t in enumerate(final_toc_titles)]
             self.toc_pages_images = []
+
         self.total_pages = len(self.toc_pages_images) + len(self.page_map)
         if progress_callback: progress_callback(1.0)
         self.is_ready = True
@@ -716,9 +1242,9 @@ class EpubProcessor:
 
         font_main = get_dynamic_toc_font(font_size)
         font_header = get_dynamic_toc_font(header_size)
-        left_margin = 40
-        right_margin = 40
-        column_gap = 20
+        left_margin = 40;
+        right_margin = 40;
+        column_gap = 20;
         limit = self.toc_items_per_page
         for i in range(0, len(toc_entries), limit):
             chunk = toc_entries[i: i + limit]
@@ -966,825 +1492,811 @@ class EpubProcessor:
         if has_bar: self._draw_progress_bar(draw, bar_y, bar_height, global_page_index)
         if has_text: self._draw_text_line(draw, text_y, font_ui, elements, align)
 
+        # --- INSIDE CLASS EpubProcessor ---
+
     def render_page(self, global_page_index):
         if not self.is_ready: return None
 
-        # --- GET SETTINGS ---
-        sharpness_val = self.layout_settings.get("text_blur", 1.0)
-        threshold_val = self.layout_settings.get("text_threshold", 130)
-        mode = self.layout_settings.get("render_mode", "Threshold")
-        white_clip = self.layout_settings.get("white_clip", 220)
+        # 1. Get current settings
         contrast = self.layout_settings.get("contrast", 1.2)
+        white_clip = self.layout_settings.get("white_clip", 220)
+        spectra_enabled = self.layout_settings.get("spectra_enabled", False)
 
         num_toc = len(self.toc_pages_images)
         footer_padding = max(0, self.bottom_padding)
         header_padding = max(0, self.top_padding)
+        content_height = max(1, self.screen_height - footer_padding - header_padding)
 
-        # Calculate available height for the actual text content
-        content_height = self.screen_height - footer_padding - header_padding
-        if content_height < 1: content_height = 1  # Safety
-
-        # --- STEP A: PREPARE CONTENT LAYER ---
-        has_image_content = False
-
+        # 2. Prepare content layer
         if global_page_index < num_toc:
-            # Table of Contents (Pre-rendered)
             img_content = self.toc_pages_images[global_page_index].copy().convert("L")
-            is_toc = True
+            is_toc, page = True, None
+            # Dummy scaling vars for TOC (though not used)
+            sx, sy = 1.0, 1.0
         else:
             is_toc = False
             doc_idx, page_idx = self.page_map[global_page_index - num_toc]
-            doc, has_image_content = self.fitz_docs[doc_idx]
+            doc, _ = self.fitz_docs[doc_idx]
             page = doc[page_idx]
 
-            # --- OPTIMIZATION START ---
-            # Calculate the exact matrix to fit the target area
-            # This replaces rendering at 3.0x and resizing with Lanczos
-            src_w = page.rect.width
-            src_h = page.rect.height
+            # --- CALCULATE SCALING FACTORS (Crucial for your snippet) ---
+            sx = self.screen_width / page.rect.width
+            sy = content_height / page.rect.height
 
-            # scaling factors
-            sx = self.screen_width / src_w
-            sy = content_height / src_h
-
-            # Use PyMuPDF to render exactly at target size (Fast C++ rendering)
+            # Render PDF page to Grayscale
             mat = fitz.Matrix(sx, sy)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-
-            # Create PIL image from bytes (Zero-copy if possible, or fast copy)
             img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
-            # --- OPTIMIZATION END ---
 
-        # Create canvas
+        # 3. Assemble full page
         full_page = Image.new("L", (self.screen_width, self.screen_height), 255)
+
+        # Define Paste Offsets
+        paste_x = (self.screen_width - img_content.width) // 2
         paste_y = 0 if is_toc else header_padding
 
-        # Determine Paste coordinates (Center horizontally if slight mismatch)
-        paste_x = (self.screen_width - img_content.width) // 2
         full_page.paste(img_content, (paste_x, paste_y))
 
-        # --- STEP B: APPLY FILTERS ---
+        # 4. Enhance Grayscale
+        # 4. Enhance Grayscale & SIMULATE PREVIEW
         if not is_toc:
-            # 1. DITHER MODE
-            if mode == "Dither":
-                if contrast != 1.0:
-                    full_page = ImageEnhance.Contrast(full_page).enhance(contrast)
+            if contrast != 1.0:
+                full_page = ImageEnhance.Contrast(full_page).enhance(contrast)
+            if white_clip < 255:
+                full_page = full_page.point(lambda p: 255 if p > white_clip else p)
 
-                # Apply White Clip (Optimized lookup)
-                if white_clip < 255:
-                    full_page = full_page.point(lambda p: 255 if p > white_clip else p)
+            # --- RESTORED STEP B: PREVIEW SIMULATION ---
+            render_mode = self.layout_settings.get("render_mode", "Threshold")
+            bit_depth = self.layout_settings.get("bit_depth", "1-bit (XTG)")
 
-                # Floyd-Steinberg Dithering
-                full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+            # 1. Apply Sharpness (Definition slider) to BOTH 1-bit and 2-bit Threshold modes
+            text_blur = self.layout_settings.get("text_blur", 1.0)
+            if render_mode == "Threshold" and text_blur > 0:
+                full_page = ImageEnhance.Sharpness(full_page).enhance(1.0 + (text_blur * 0.5))
 
-            # 2. THRESHOLD MODE
+            if "2-bit" in bit_depth:
+                if render_mode == "Dither":
+                    # FIX 1: Prevent white-on-black inversion by forcing an exact grayscale palette
+                    pal = Image.new('P', (1, 1))
+                    pal.putpalette([0, 0, 0, 85, 85, 85, 170, 170, 170, 255, 255, 255] + [0] * 756)
+                    # Convert to RGB first, quantize, then back to L to guarantee correct colors
+                    full_page = full_page.convert("RGB").quantize(palette=pal,
+                                                                  dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+                else:
+                    # FIX 2: Make the Threshold slider work in 2-bit mode
+                    thresh = self.layout_settings.get("text_threshold", 130)
+
+                    # Shift pixel brightness based on slider (128 is neutral).
+                    # High threshold = darker image (thicker text). Low threshold = brighter image.
+                    brightness_shift = 128 - thresh
+                    full_page = full_page.point(lambda p: max(0, min(255, p + brightness_shift)))
+
+                    # Snap to 4 distinct hardware shades (0, 85, 170, 255)
+                    full_page = full_page.point(lambda p: (p // 64) * 85).convert("L")
             else:
-                # If page has images, we might want Dither even in Threshold mode
-                # (Optional logic, sticking to your default logic here)
-                if has_image_content:
-                    # Simple contrast boost for mixed content
-                    full_page = ImageEnhance.Contrast(full_page).enhance(1.2)
+                if render_mode == "Dither":
                     full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
                 else:
-                    # Pure Text Optimization
-                    if sharpness_val > 0:
-                        enhancer = ImageEnhance.Sharpness(full_page)
-                        full_page = enhancer.enhance(1.0 + (sharpness_val * 0.5))
+                    thresh = self.layout_settings.get("text_threshold", 130)
+                    full_page = full_page.point(lambda p: 255 if p > thresh else 0).convert("L")
 
-                    # Fast Thresholding
-                    full_page = full_page.point(lambda p: 255 if p > threshold_val else 0).convert("L")
-
-        # --- STEP C: UI OVERLAY ---
-        # Convert to RGB only for the colored UI drawing
+        # 5. UI Overlay (Header/Footer/Spectra)
         img_final = full_page.convert("RGB")
         draw = ImageDraw.Draw(img_final)
 
         if not is_toc:
-            # Mask Header/Footer areas with White before drawing text
-            if header_padding > 0:
-                draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
-            if footer_padding > 0:
-                draw.rectangle([0, self.screen_height - footer_padding, self.screen_width, self.screen_height],
-                               fill=(255, 255, 255))
+            # Clear margin areas
+            if header_padding > 0: draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
+            if footer_padding > 0: draw.rectangle(
+                [0, self.screen_height - footer_padding, self.screen_width, self.screen_height], fill=(255, 255, 255))
 
             self._draw_header(draw, global_page_index)
             self._draw_footer(draw, global_page_index)
 
+            # --- YOUR IMPROVED SPECTRA RENDERING LOGIC ---
+            page_annotations = self.page_annotation_data.get((doc_idx, page_idx), {})
+
+            if page_annotations and spectra_enabled and page:
+                annot_font_size = max(9, int(self.font_size * 0.65))
+                annot_font = self._get_ui_font(annot_font_size)
+
+                drawn_items = []
+
+                # Get all words on page to match coordinates
+                page_words = page.get_text("words")
+
+                for x0, y0, x1, y1, text, block, line, word_idx in page_words:
+                    # 1. Clean punctuation
+                    clean_text = text.strip('.,!?;:"()[]{}“”')
+
+                    # --- RESTORED PROTECTION ---
+                    # Note: This will hide annotations for words at the start of sentences
+                    # (e.g., "Suddenly" -> "Fast") because "Suddenly" is not lower case.
+                    if not clean_text.islower():
+                        continue
+                    # ---------------------------
+
+                    coord_key = f"{int(x0)}_{int(y0)}"
+
+                    if coord_key not in page_annotations:
+                        continue
+
+                    defi = page_annotations[coord_key]
+
+                    # We check for both character length and word count to be safe - protection against hallucination.
+
+                    if not defi or len(defi) > 35 or len(defi.split()) > 5:
+                        continue
+
+                    # --- RENDER LOGIC ---
+                    is_duplicate = False
+
+                    # Convert PDF coordinates to Image Pixel coordinates
+                    px_x = x0 * sx
+                    px_y = y0 * sy
+                    px_w = (x1 - x0) * sx
+
+                    # Check vertical collision (prevent overlapping definitions)
+                    for prev_y, prev_def in drawn_items:
+                        if prev_def == defi:
+                            # If same definition is closer than 2.5 lines, skip it
+                            if abs(px_y - prev_y) < (self.font_size * 1.5):
+                                is_duplicate = True
+                                break
+
+                    if is_duplicate: continue
+
+                    # Calculate Draw Position
+                    text_len = annot_font.getlength(defi)
+
+                    # Center text over the word
+                    draw_x = paste_x + px_x + (px_w - text_len) / 2
+
+                    # Screen Boundary Checks (Left/Right)
+                    if draw_x < 2: draw_x = 2
+                    if draw_x + text_len > self.screen_width - 2:
+                        draw_x = self.screen_width - text_len - 2
+
+                    # Vertical Position (Above the word)
+                    draw_y = paste_y + px_y - annot_font_size + 2
+
+                    # Header Boundary Check
+                    if draw_y < header_padding: draw_y = header_padding
+
+                    # Draw
+                    draw.text((draw_x, draw_y), defi, font=annot_font, fill=(0, 0, 0))
+                    drawn_items.append((px_y, defi))
+
         return img_final
+
+    def _pack_metadata(self, title, author, lang, chapter_count):
+        """Packs metadata into a 256-byte fixed-size block."""
+        # Fields: Title(128), Author(64), Publisher(32), Language(16),
+        # CreateTime(4), CoverPage(2), ChapterCount(2), Reserved(8)
+        blob = bytearray(256)
+        struct.pack_into("<128s", blob, 0x00, title.encode('utf-8')[:127])
+        struct.pack_into("<64s", blob, 0x80, author.encode('utf-8')[:63])
+        struct.pack_into("<32s", blob, 0xC0, b"EPUB2XTC")  # Publisher
+        struct.pack_into("<16s", blob, 0xE0, lang.encode('utf-8')[:15])
+        struct.pack_into("<I", blob, 0xF0, int(time.time()))
+        struct.pack_into("<H", blob, 0xF4, 0)  # Cover Page (usually 0)
+        struct.pack_into("<H", blob, 0xF6, chapter_count)
+        return bytes(blob)
+
+    def _pack_chapter(self, name, start_pg, end_pg):
+        """Packs a single chapter into a 96-byte fixed-size block."""
+        # Fields: Name(80), Start(2), End(2), Reserved1-3(4+4+4)
+        blob = bytearray(96)
+        struct.pack_into("<80s", blob, 0x00, name.encode('utf-8')[:79])
+        struct.pack_into("<H", blob, 0x50, start_pg)
+        struct.pack_into("<H", blob, 0x52, end_pg)
+        return bytes(blob)
 
     def save_xtc(self, out_name, progress_callback=None):
         if not self.is_ready: return
 
-        # Prepare headers
-        blob_accumulator = []
-        idx_accumulator = []
+        # 1. SETUP PARAMETERS & DEPTH
+        bit_depth = self.layout_settings.get("bit_depth", "1-bit (XTG)")
+        render_mode = self.layout_settings.get("render_mode", "Threshold")
+        is_2bit = "2-bit" in bit_depth
+        file_id = 0x00485458 if is_2bit else 0x00475458
 
-        # Offset calculation
-        # Header (56 bytes) + Index Entries (16 bytes * total_pages)
-        data_off_start = 56 + (16 * self.total_pages)
-        current_data_offset = data_off_start
+        # Determine how many TOC pages exist (to sync chapter start pages)
+        num_toc_pages = len(self.toc_pages_images)
 
-        # --- HELPER WORKER FUNCTION ---
-        def process_page_worker(page_index):
-            # Render
-            img_rgb = self.render_page(page_index)
-            img_final = img_rgb.convert("1")
-            w, h = img_final.size
+        # 2. CALCULATE FILE OFFSETS
+        metadata_off = 56
+        chapter_off = metadata_off + 256
+        num_chaps = len(self.toc_data_final)
+        index_off = chapter_off + (num_chaps * 96)
+        data_off = index_off + (self.total_pages * 16)
 
-            # Create XTC Page Block
-            # 0x00475458 = 'XTG\0'
-            img_bytes = img_final.tobytes()
-            xtg_header = struct.pack("<IHHBBIQ",
-                                     0x00475458,
-                                     w, h,
-                                     0, 0,
-                                     ((w + 7) // 8) * h,  # Stride/Size calc
-                                     0)
+        # 3. PACK METADATA
+        book_title = getattr(self, 'title_metadata', "Unknown Title")
+        book_author = getattr(self, 'author_metadata', "Unknown Author")
+        metadata_block = self._pack_metadata(book_title, book_author, self.book_lang, num_chaps)
 
-            full_page_blob = xtg_header + img_bytes
-            return full_page_blob, w, h
+        # 4. PACK CHAPTERS (Synchronized with Visual TOC)
+        chapter_block = bytearray()
+        for i, (title, start_pg_from_renderer) in enumerate(self.toc_data_final):
+            # start_pg_from_renderer is already 1-based and includes TOC offset
+            # XTC internal structure expects 0-based index
+            start_idx = start_pg_from_renderer - 1
 
-        # --- PARALLEL EXECUTION ---
-        # Using ThreadPoolExecutor because PyMuPDF fitz.Document isn't easily pickle-able
-        # for ProcessPool, but fits handles threading reasonably well for reading.
-        max_workers = os.cpu_count()
-        results = []
+            # Calculate end index (inclusive)
+            if i + 1 < num_chaps:
+                next_chap_start = self.toc_data_final[i + 1][1]
+                end_idx = next_chap_start - 2  # Page before next chapter starts
+            else:
+                end_idx = self.total_pages - 1
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all pages
-            future_to_page = {executor.submit(process_page_worker, i): i for i in range(self.total_pages)}
+            chapter_block.extend(self._pack_chapter(title, start_idx, end_idx))
 
-            # Process results as they complete, but we need to store them in ORDER
-            # So we use map, or just sort results later. Map is cleaner.
-            pass
+        # 5. PROCESS ALL PAGES (TOC + CONTENT)
+        blob_data, index_table = bytearray(), bytearray()
 
-            # Map preserves order
-            for i, result in enumerate(executor.map(process_page_worker, range(self.total_pages))):
-                if progress_callback:
-                    progress_callback((i + 1) / self.total_pages)
+        for i in range(self.total_pages):
+            if progress_callback: progress_callback((i + 1) / self.total_pages)
 
-                page_blob, w, h = result
-                blob_size = len(page_blob)
+            img_rgb = self.render_page(i)
+            img_gray = img_rgb.convert("L")
+            w, h = img_gray.size
 
-                # Build Index Entry
-                # Offset (Q), Size (I), Width (H), Height (H)
-                idx_entry = struct.pack("<QIHH", current_data_offset, blob_size, w, h)
+            if is_2bit:
+                # --- XTH 2-BIT VERTICAL SCAN ORDER ---
+                # Quantize/Posterize to 4 levels
+                if render_mode == "Dither":
+                    pal = Image.new('P', (1, 1))
+                    # Palette: White, Light Gray, Dark Gray, Black
+                    pal.putpalette([255, 255, 255, 170, 170, 170, 85, 85, 85, 0, 0, 0] + [0] * 756)
+                    quant = img_gray.quantize(palette=pal, dither=Image.DITHER.FLOYDSTEINBERG)
+                else:
+                    # 255 (White) // 64 = 3 -> (3-3) = 0 (White)
+                    # 0 (Black) // 64 = 0 -> (3-0) = 3 (Black)
+                    quant = img_gray.point(lambda p: (3 - (p // 64)))
 
-                idx_accumulator.append(idx_entry)
-                blob_accumulator.append(page_blob)
+                pix = quant.load()
+                bytes_per_col = (h + 7) // 8
+                p1, p2 = bytearray(bytes_per_col * w), bytearray(bytes_per_col * w)
 
-                current_data_offset += blob_size
+                # Scan: Right to Left -> Top to Bottom
+                for x_idx, x in enumerate(range(w - 1, -1, -1)):
+                    for y in range(h):
+                        val = pix[x, y] & 0x03
+                        bit1 = (val >> 1) & 0x01
+                        bit2 = val & 0x01
 
-        # --- WRITE FILE ---
-        # Header: 'XTX\0' (0x00435458), Version 0x0100
+                        target_byte = (x_idx * bytes_per_col) + (y // 8)
+                        bit_pos = 7 - (y % 8)  # MSB is top
+
+                        if bit1: p1[target_byte] |= (1 << bit_pos)
+                        if bit2: p2[target_byte] |= (1 << bit_pos)
+
+                bitmap_data = bytes(p1) + bytes(p2)
+                data_size = len(bitmap_data)
+            else:
+                # --- XTG 1-BIT ROW-MAJOR ---
+                if render_mode == "Dither":
+                    img_final = img_gray.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+                else:
+                    thresh = self.layout_settings.get("text_threshold", 130)
+                    img_final = img_gray.point(lambda p: 255 if p > thresh else 0).convert("1")
+
+                bitmap_data = img_final.tobytes()
+                data_size = ((w + 7) // 8) * h
+
+            # Page Blob = 22-byte XTG/XTH Header + Bitmap
+            xt_header = struct.pack("<IHHBBIQ", file_id, w, h, 0, 0, data_size, 0)
+            page_blob = xt_header + bitmap_data
+
+            # Index entry (absolute offset from file start)
+            index_table.extend(struct.pack("<QIHH", data_off + len(blob_data), len(page_blob), w, h))
+            blob_data.extend(page_blob)
+
+        # 6. FINAL CONTAINER HEADER
         header = struct.pack("<IHHBBBBIQQQQQ",
-                             0x00435458, 0x0100, self.total_pages,
-                             0, 0, 0, 0, 0, 0,
-                             56,  # Offset to Index
-                             data_off_start,  # Offset to Data
-                             0, 0)
+                             0x00435458,  # Identifier
+                             0x0100,  # Version (Must be here at Offset 0x04)
+                             self.total_pages,  # Page Count (Must be here at Offset 0x06)
+                             0, 1, 0, 1, 1,  # Flags
+                             metadata_off, index_off, data_off, 0, chapter_off
+                             )
+        # Note: The format of struct.pack above must match the 56-byte definition exactly.
+        # Ensure the number of 'Q' (uint64) and 'I' (uint32) matches your spec.
 
         with open(out_name, "wb") as f:
             f.write(header)
-            for idx_chunk in idx_accumulator:
-                f.write(idx_chunk)
-            for blob_chunk in blob_accumulator:
-                f.write(blob_chunk)
+            f.write(metadata_block)
+            f.write(chapter_block)
+            f.write(index_table)
+            f.write(blob_data)
+
+# --- UI COLORS ---
+COLOR_BG = "#111111"
+COLOR_TOOLBAR = "#1a1a1a"
+COLOR_CARD = "#2B2B2B"
+COLOR_ACCENT = "#3498DB"
+COLOR_SUCCESS = "#2ECC71"
+COLOR_WARNING = "#E67E22"
+COLOR_DANGER = "#C0392B"
+COLOR_TEXT_GRAY = "#AAAAAA"
 
 
-class App(ctk.CTk):
+class SettingsCard(ctk.CTkFrame):
+    def __init__(self, parent, title, expanded=False):
+        super().__init__(parent, fg_color=COLOR_CARD, corner_radius=10, border_width=1, border_color="#333")
+        self.pack(fill="x", pady=5, padx=10)
+
+        self.title_text = title
+        self.is_expanded = expanded
+
+        # 1. HEADER: Use a Button instead of a Label to make it clickable
+        # We use transparent fg_color so it looks like a header but reacts to hover
+        self.btn_header = ctk.CTkButton(
+            self,
+            text=f"{'▼' if expanded else '▶'} {title}",
+            command=self.toggle,
+            fg_color="transparent",
+            hover_color="#404040",
+            anchor="w",
+            font=("Arial", 13, "bold"),
+            text_color="#FFF",
+            height=35
+        )
+        self.btn_header.pack(fill="x", padx=2, pady=2)
+
+        # 2. CONTENT FRAME: Created immediately so widgets can be added to it,
+        # but only packed (shown) if expanded is True.
+        self.content = ctk.CTkFrame(self, fg_color="transparent")
+
+        if self.is_expanded:
+            self.content.pack(fill="x", padx=10, pady=(0, 10))
+
+    def toggle(self):
+        """Show/Hide the content frame"""
+        self.is_expanded = not self.is_expanded
+
+        if self.is_expanded:
+            self.btn_header.configure(text=f"▼ {self.title_text}")
+            self.content.pack(fill="x", padx=10, pady=(0, 10))
+        else:
+            self.btn_header.configure(text=f"▶ {self.title_text}")
+            self.content.pack_forget()
+
+
+class ModernApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        # Load AoA on startup
+        load_aoa_database()
+
         self.processor = EpubProcessor()
         self.current_page_index = 0
         self.debounce_timer = None
         self.is_processing = False
+        self.pending_rerun = False
         self.selected_chapter_indices = []
-
-        if not os.path.exists(PRESETS_DIR):
-            os.makedirs(PRESETS_DIR)
-
+        self.title("EPUB2XTC Converter")
+        self.geometry("1400x950")
+        self.configure(fg_color=COLOR_BG)
+        if not os.path.exists(PRESETS_DIR): os.makedirs(PRESETS_DIR)
         self.startup_settings = FACTORY_DEFAULTS.copy()
         self.load_startup_defaults()
+        self._build_toolbar()
+        self.main_container = ctk.CTkFrame(self, fg_color=COLOR_BG)
+        self.main_container.pack(fill="both", expand=True)
+        self._build_sidebar()
+        self._build_preview_area()
+        self.refresh_presets_list()
+        self.apply_settings_dict(self.startup_settings)
 
-        self.title("EPUB2XTC")
-        self.geometry("1500x950")
+    def _build_toolbar(self):
+        tb = ctk.CTkFrame(self, height=70, fg_color=COLOR_TOOLBAR, corner_radius=0)
+        tb.pack(fill="x", side="top")
+        logo_f = ctk.CTkFrame(tb, fg_color="transparent")
+        logo_f.pack(side="left", padx=(20, 30))
+        ctk.CTkLabel(logo_f, text="EPUB2XTC", font=("Arial", 20, "bold"), text_color=COLOR_ACCENT).pack(anchor="w")
+        self.lbl_file = ctk.CTkLabel(logo_f, text="No file selected", font=("Arial", 12), text_color="gray", anchor="w")
+        self.lbl_file.pack(anchor="w")
+        self._create_icon_btn(tb, "＋ Import EPUB", COLOR_SUCCESS, self.select_file)
+        self._create_divider(tb)
+        self.btn_chapters = self._create_icon_btn(tb, "☰ Edit TOC", COLOR_WARNING, self.open_chapter_dialog, "disabled")
+        self.btn_export = self._create_icon_btn(tb, "⚡ Save .XTC", COLOR_ACCENT, self.export_file, "disabled")
+        self.btn_cover = self._create_icon_btn(tb, "🖼 Export Cover", "#8E44AD", self.open_cover_export, "disabled")
+        self._create_divider(tb)
+        self._create_icon_btn(tb, "⟲ Reset Settings", "#555", self.reset_to_factory)
+        right_f = ctk.CTkFrame(tb, fg_color="transparent")
+        right_f.pack(side="right", padx=20, fill="y")
+        self.progress_label = ctk.CTkLabel(right_f, text="Ready", font=("Arial", 12), text_color="gray", anchor="e")
+        self.progress_label.pack(side="top", pady=(15, 0), anchor="e")
+        self.progress_bar = ctk.CTkProgressBar(right_f, width=200, height=8, progress_color=COLOR_ACCENT)
+        self.progress_bar.set(0)
+        self.progress_bar.pack(side="bottom", pady=(0, 15))
 
-        # --- MAIN GRID LAYOUT ---
-        self.grid_columnconfigure(0, weight=0)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_columnconfigure(2, weight=0)
-        self.grid_rowconfigure(0, weight=1)
+    def refresh_all_slider_labels(self):
+        """Forces all labels to match the current slider values (used after loading presets)."""
+        # List of all your slider attributes
+        sliders = [
+            ("lbl_size", "slider_font_size"),
+            ("lbl_weight", "slider_font_weight"),
+            ("lbl_line", "slider_line_height"),
+            ("lbl_margin", "slider_margin"),
+            ("lbl_top_padding", "slider_top_padding"),
+            ("lbl_padding", "slider_bottom_padding"),
+            ("lbl_spectra_thresh", "slider_spectra_threshold"),
+            ("lbl_spectra_aoa", "slider_spectra_aoa_threshold"),
+            ("lbl_white_clip", "slider_white_clip"),
+            ("lbl_contrast", "slider_contrast"),
+            ("lbl_threshold", "slider_text_threshold"),
+            ("lbl_blur", "slider_text_blur"),
+            ("lbl_header_size", "slider_header_font_size"),
+            ("lbl_header_margin", "slider_header_margin"),
+            ("lbl_footer_size", "slider_footer_font_size"),
+            ("lbl_footer_margin", "slider_footer_margin"),
+            ("lbl_preview_zoom", "slider_preview_zoom"),
+            ("lbl_marker_size", "slider_bar_marker_radius"),
+            ("lbl_tick_height", "slider_bar_tick_height"),
+            ("lbl_bar_thick", "slider_bar_height"),
+        ]
 
-        # ==============================================================================
-        # [LEFT COLUMN] SIDEBAR: FILE, STRUCTURE, LAYOUT, TYPOGRAPHY
-        # ==============================================================================
-        self.left_sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
-        self.left_sidebar.grid(row=0, column=0, sticky="nsew")
+        for lbl_attr, sld_attr in sliders:
+            if hasattr(self, lbl_attr) and hasattr(self, sld_attr):
+                label_widget = getattr(self, lbl_attr)
+                slider_widget = getattr(self, sld_attr)
+                formatter = getattr(self, f"fmt_{sld_attr}")
+                label_widget.configure(text=formatter(slider_widget.get()))
 
-        # 1. FILE SELECTION
-        self._add_section_divider(self.left_sidebar)
-        ctk.CTkLabel(self.left_sidebar, text="FILE", font=("Arial", 14, "bold")).pack(pady=(15, 5))
-        ctk.CTkButton(self.left_sidebar, text="Select EPUB", command=self.select_file, height=30).pack(padx=20, pady=5,
-                                                                                                       fill="x")
-        self.lbl_file = ctk.CTkLabel(self.left_sidebar, text="No file selected", text_color="gray", height=16)
-        self.lbl_file.pack(padx=20, pady=(0, 5))
+    def _build_sidebar(self):
+        self.sidebar = ctk.CTkScrollableFrame(self.main_container, width=400, fg_color="transparent")
+        self.sidebar.pack(side="left", fill="y", padx=10, pady=10)
 
-        self._add_section_divider(self.left_sidebar)
+        # --- PRESETS ---
+        c_pre = SettingsCard(self.sidebar, "PRESETS")
+        row_pre = ctk.CTkFrame(c_pre.content, fg_color="transparent")
+        row_pre.pack(fill="x")
+        self.preset_var = ctk.StringVar(value="Select Preset...")
+        self.preset_dropdown = ctk.CTkOptionMenu(row_pre, variable=self.preset_var, values=[],
+                                                 command=self.load_selected_preset, fg_color="#444",
+                                                 button_color="#555", height=22, font=("Arial", 12))
+        self.preset_dropdown.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        ctk.CTkButton(row_pre, text="💾", width=30, height=22, command=self.save_new_preset,
+                      fg_color=COLOR_SUCCESS).pack(side="left")
+        ctk.CTkButton(c_pre.content, text="Set Current as Default", command=self.save_current_as_default,
+                      fg_color="#444", hover_color=COLOR_ACCENT, height=24).pack(fill="x", pady=(5, 0))
 
-        # 2. STRUCTURE
-        ctk.CTkLabel(self.left_sidebar, text="STRUCTURE", font=("Arial", 14, "bold")).pack(pady=5)
-        self.var_toc = ctk.BooleanVar(value=self.startup_settings["generate_toc"])
-        ctk.CTkCheckBox(self.left_sidebar, text="Generate TOC Pages", variable=self.var_toc,
-                        command=self.schedule_update).pack(padx=20, pady=5, anchor="w")
-        self.var_footnotes = ctk.BooleanVar(value=self.startup_settings.get("show_footnotes", True))
-        ctk.CTkCheckBox(self.left_sidebar, text="Inline Footnotes", variable=self.var_footnotes,
-                        command=self.schedule_update).pack(padx=20, pady=5, anchor="w")
-        self.btn_chapters = ctk.CTkButton(self.left_sidebar, text="Edit Chapter Visibility", height=30,
-                                          command=self.open_chapter_dialog, state="disabled", fg_color="gray")
-        self.btn_chapters.pack(padx=20, pady=10, fill="x")
+        # --- RENDER ENGINE ---
+        c_ren = SettingsCard(self.sidebar, "RENDER ENGINE")
 
-        self._add_section_divider(self.left_sidebar)
+        # 1. Selection: Bit Depth / Format
+        r_depth = ctk.CTkFrame(c_ren.content, fg_color="transparent")
+        r_depth.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_depth, text="Target Format:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.bit_depth_var = ctk.StringVar(value=self.startup_settings.get("bit_depth", "1-bit (XTG)"))
+        ctk.CTkOptionMenu(r_depth, values=["1-bit (XTG)", "2-bit (XTH)"], variable=self.bit_depth_var,
+                          command=self.schedule_update, height=22).pack(side="right", fill="x", expand=True)
 
-        # 3. PAGE LAYOUT
-        ctk.CTkLabel(self.left_sidebar, text="PAGE LAYOUT", font=("Arial", 14, "bold")).pack(pady=5)
+        # 2. Selection: Conversion Algorithm
+        r_mode = ctk.CTkFrame(c_ren.content, fg_color="transparent")
+        r_mode.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_mode, text="Conversion:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.render_mode_var = ctk.StringVar(value=self.startup_settings.get("render_mode", "Threshold"))
+        ctk.CTkOptionMenu(r_mode, values=["Threshold", "Dither"], variable=self.render_mode_var,
+                          command=self.toggle_render_controls, height=22).pack(side="right", fill="x", expand=True)
 
-        row_orient = ctk.CTkFrame(self.left_sidebar, fg_color="transparent")
-        row_orient.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(row_orient, text="Orientation:").pack(side="left", anchor="w")
-        self.orientation_var = ctk.StringVar(value=self.startup_settings["orientation"])
-        ctk.CTkOptionMenu(row_orient, values=["Portrait", "Landscape"], variable=self.orientation_var, width=120,
-                          command=self.schedule_update).pack(side="right")
+        self.frm_render_dynamic = ctk.CTkFrame(c_ren.content, fg_color="transparent")
+        self.frm_render_dynamic.pack(fill="x", pady=5)
 
-        self.create_slider_group(self.left_sidebar, "lbl_margin", f"Side Margin: {self.startup_settings['margin']}px",
-                                 "slider_margin", 0, 100, self.update_margin_label, self.startup_settings['margin'])
-        self.create_slider_group(self.left_sidebar, "lbl_top_padding",
-                                 f"Top Padding: {self.startup_settings['top_padding']}px", "slider_top_padding", 0, 150,
-                                 self.update_top_padding_label, self.startup_settings['top_padding'])
-        self.create_slider_group(self.left_sidebar, "lbl_padding",
-                                 f"Bottom Padding: {self.startup_settings['bottom_padding']}px", "slider_padding", 0,
-                                 150, self.update_padding_label, self.startup_settings['bottom_padding'])
+        # 3. Sliders: Dither Path
+        self.frm_dither = ctk.CTkFrame(self.frm_render_dynamic, fg_color="transparent")
+        self.sld_white = self._create_slider(self.frm_dither, "lbl_white_clip", "White Clip", "slider_white_clip", 150,
+                                             255)
+        self.sld_contrast = self._create_slider(self.frm_dither, "lbl_contrast", "Contrast", "slider_contrast", 0.5,
+                                                2.0, is_float=True)
 
-        self._add_section_divider(self.left_sidebar)
+        # 4. Sliders: Threshold Path
+        self.frm_thresh = ctk.CTkFrame(self.frm_render_dynamic, fg_color="transparent")
+        self.sld_thresh = self._create_slider(self.frm_thresh, "lbl_threshold", "Threshold", "slider_text_threshold",
+                                              50, 200)
+        self.sld_blur = self._create_slider(self.frm_thresh, "lbl_blur", "Definition", "slider_text_blur", 0.0, 3.0,
+                                            is_float=True)
 
-        # 4. TYPOGRAPHY
-        ctk.CTkLabel(self.left_sidebar, text="TYPOGRAPHY", font=("Arial", 14, "bold")).pack(pady=5)
+        self.toggle_render_controls()
 
-        row_font_tools = ctk.CTkFrame(self.left_sidebar, fg_color="transparent")
-        row_font_tools.pack(fill="x", padx=20, pady=5)
-
-        ctk.CTkLabel(row_font_tools, text="Font:").grid(row=0, column=0, sticky="w")
+        # --- TYPOGRAPHY ---
+        c_type = SettingsCard(self.sidebar, "TYPOGRAPHY")
+        r_font = ctk.CTkFrame(c_type.content, fg_color="transparent")
+        r_font.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_font, text="Font Family:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
         self.available_fonts = get_local_fonts()
         self.font_options = ["Default (System)"] + sorted(list(self.available_fonts.keys()))
         self.font_map = self.available_fonts.copy()
         self.font_map["Default (System)"] = "DEFAULT"
-        self.font_dropdown = ctk.CTkOptionMenu(row_font_tools, values=self.font_options, width=180,
-                                               command=self.on_font_change)
+        self.font_dropdown = ctk.CTkOptionMenu(r_font, values=self.font_options, command=self.on_font_change, height=22,
+                                               font=("Arial", 12))
         self.font_dropdown.set(self.startup_settings.get("font_name", "Default (System)"))
-        self.font_dropdown.grid(row=0, column=1, sticky="e", padx=(10, 0))
-
-        ctk.CTkLabel(row_font_tools, text="Align:").grid(row=1, column=0, sticky="w", pady=(5, 0))
-        self.align_dropdown = ctk.CTkOptionMenu(row_font_tools, values=["justify", "left"], width=180,
-                                                command=self.schedule_update)
+        self.font_dropdown.pack(side="right", fill="x", expand=True)
+        r_align = ctk.CTkFrame(c_type.content, fg_color="transparent")
+        r_align.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_align, text="Alignment:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.align_dropdown = ctk.CTkOptionMenu(r_align, values=["justify", "left"], command=self.schedule_update,
+                                                height=22, font=("Arial", 12))
         self.align_dropdown.set(self.startup_settings["text_align"])
-        self.align_dropdown.grid(row=1, column=1, sticky="e", padx=(10, 0), pady=(5, 0))
+        self.align_dropdown.pack(side="right", fill="x", expand=True)
+        self._create_slider(c_type.content, "lbl_size", "Font Size", "slider_font_size", 12, 48)
+        self._create_slider(c_type.content, "lbl_weight", "Font Weight", "slider_font_weight", 100, 900)
+        self._create_slider(c_type.content, "lbl_line", "Line Height", "slider_line_height", 1.0, 2.5, is_float=True)
 
-        self.create_slider_group(self.left_sidebar, "lbl_size", f"Font Size: {self.startup_settings['font_size']}pt",
-                                 "slider_size", 12, 48, self.update_size_label, self.startup_settings['font_size'])
-        self.create_slider_group(self.left_sidebar, "lbl_weight",
-                                 f"Font Weight: {self.startup_settings['font_weight']}", "slider_weight", 100, 900,
-                                 self.update_weight_label, self.startup_settings['font_weight'])
-        self.create_slider_group(self.left_sidebar, "lbl_line", f"Line Height: {self.startup_settings['line_height']}",
-                                 "slider_line", 1.0, 2.5, self.update_line_label, self.startup_settings['line_height'])
+        # --- LAYOUT ---
+        c_lay = SettingsCard(self.sidebar, "PAGE LAYOUT")
+        r_ori = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_ori.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_ori, text="Orientation:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.orientation_var = ctk.StringVar(value=self.startup_settings["orientation"])
+        ctk.CTkOptionMenu(r_ori, values=["Portrait", "Landscape"], variable=self.orientation_var,
+                          command=self.schedule_update, height=22, font=("Arial", 12)).pack(side="right", fill="x",
+                                                                                            expand=True)
+        r_tog = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_tog.pack(fill="x", pady=5)
+        self.var_toc = ctk.BooleanVar(value=self.startup_settings["generate_toc"])
+        ctk.CTkCheckBox(r_tog, text="Generate TOC", variable=self.var_toc, command=self.schedule_update,
+                        font=("Arial", 12)).pack(side="left")
+        self.var_footnotes = ctk.BooleanVar(value=self.startup_settings.get("show_footnotes", True))
+        ctk.CTkCheckBox(r_tog, text="Inline Footnotes", variable=self.var_footnotes, command=self.schedule_update,
+                        font=("Arial", 12)).pack(side="right")
+        self._create_slider(c_lay.content, "lbl_margin", "Side Margin", "slider_margin", 0, 100)
+        self._create_slider(c_lay.content, "lbl_top_padding", "Top Padding", "slider_top_padding", 0, 150)
+        self._create_slider(c_lay.content, "lbl_padding", "Bottom Padding", "slider_bottom_padding", 0, 150)
 
-        # ==============================================================================
-        # [RIGHT COLUMN] SIDEBAR: HEADERS & FOOTERS
-        # ==============================================================================
-        self.right_sidebar = ctk.CTkScrollableFrame(self, width=320, corner_radius=0)
-        self.right_sidebar.grid(row=0, column=2, sticky="nsew")
-        self._create_header_footer_controls(self.right_sidebar)
 
-        # ==============================================================================
-        # [CENTER COLUMN] MAIN PREVIEW & BOTTOM CONTROL BAR
-        # ==============================================================================
-        self.center_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.center_frame.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
+        # --- HEADER & FOOTER ---
+        c_hf = SettingsCard(self.sidebar, "HEADER & FOOTER")
+        grid_hf = ctk.CTkFrame(c_hf.content, fg_color="transparent")
+        grid_hf.pack(fill="x")
 
-        # 1. PREVIEW AREA
-        self.preview_container = ctk.CTkFrame(self.center_frame, fg_color="transparent")
-        self.preview_container.pack(side="top", fill="both", expand=True, padx=20, pady=20)
+        # --- SPECTRA AI ANNOTATIONS (ISSUE 4 FIX: SEPARATE GEN FROM VIEW) ---
+        c_spectra = SettingsCard(self.sidebar, "SPECTRA AI ANNOTATIONS")
 
-        # Create the scrollable frame
-        self.preview_scroll = ctk.CTkScrollableFrame(self.preview_container, fg_color="transparent")
-        self.preview_scroll.pack(expand=True, fill="both")
+        if not HAS_WORDFREQ or not HAS_OPENAI:
+            ctk.CTkLabel(c_spectra.content, text="Missing libraries:\npip install wordfreq openai",
+                         text_color=COLOR_DANGER).pack(pady=5)
+            self.var_spectra_enabled = ctk.BooleanVar(value=False)
+        else:
 
-        # Hide scrollbar width
+            self.var_spectra_enabled = ctk.BooleanVar(value=self.startup_settings.get("spectra_enabled", False))
+            ctk.CTkCheckBox(c_spectra.content, text="Show Definitions Overlay", variable=self.var_spectra_enabled,
+                            command=self.schedule_update).pack(anchor="w", pady=5)
+
+            # --- NEW LANGUAGE DROPDOWN ---
+            ctk.CTkLabel(c_spectra.content, text="Target Language:", font=("Arial", 12), anchor="w").pack(anchor="w")
+            self.var_spectra_lang = ctk.StringVar(value=self.startup_settings.get("spectra_target_lang", "English"))
+            languages = ["English", "Spanish", "French", "German", "Italian", "Polish", "Portuguese", "Russian",
+                         "Chinese", "Japanese"]
+            ctk.CTkOptionMenu(c_spectra.content, variable=self.var_spectra_lang, values=languages).pack(fill="x",
+                                                                                                        pady=(0, 5))
+
+            # Manual Trigger for API calls
+            self.btn_spectra_gen = ctk.CTkButton(c_spectra.content, text="⚡ Analyze & Generate Definitions",
+                                                 command=self.run_spectra_analysis, fg_color="#E67E22",
+                                                 hover_color="#D35400")
+            self.btn_spectra_gen.pack(fill="x", pady=5)
+
+            def set_level(choice):
+                if choice == "A2 (Beginner)":
+                    self.slider_spectra_threshold.set(5.5)  # Common words
+                    self.slider_spectra_aoa_threshold.set(4.0)  # Child words okay
+                elif choice == "B1 (Intermediate)":
+                    self.slider_spectra_threshold.set(4.5)
+                    self.slider_spectra_aoa_threshold.set(8.0)
+                elif choice == "B2 (Upper Intermediate)":
+                    self.slider_spectra_threshold.set(3.8)  # Rarer words
+                    self.slider_spectra_aoa_threshold.set(10.0)  # No child words
+                elif choice == "C1 (Advanced)":
+                    self.slider_spectra_threshold.set(3.2)  # Very rare words
+                    self.slider_spectra_aoa_threshold.set(13.0)  # Academic only
+
+                # Update label text for sliders
+                self.lbl_spectra_thresh.configure(
+                    text=f"Zipf Difficulty (Max): {self.slider_spectra_threshold.get():.1f}")
+                self.lbl_spectra_aoa.configure(
+                    text=f"Min. Age of Acquisition: {self.slider_spectra_aoa_threshold.get():.1f}")
+
+                self.schedule_update()
+
+            ctk.CTkLabel(c_spectra.content, text="Quick Level Select:", font=("Arial", 12, "bold"), anchor="w").pack(
+                anchor="w", pady=(5, 0))
+            self.level_var = ctk.StringVar(value="Select Level...")
+            self.level_dropdown = ctk.CTkOptionMenu(
+                c_spectra.content,
+                variable=self.level_var,
+                values=["A2 (Beginner)", "B1 (Intermediate)", "B2 (Upper Intermediate)", "C1 (Advanced)"],
+                command=set_level
+            )
+            self.level_dropdown.pack(fill="x", pady=5)
+
+            # Inside _build_sidebar -> Spectra Section
+            self._create_slider(c_spectra.content, "lbl_spectra_thresh", "Zipf Difficulty (Max)",
+                                "slider_spectra_threshold",
+                                1.0, 7.0, is_float=True, trigger_auto_update=False)
+
+            self._create_slider(c_spectra.content, "lbl_spectra_aoa", "Min. Age of Acquisition",
+                                "slider_spectra_aoa_threshold",
+                                0.0, 25.0, is_float=True, trigger_auto_update=False)
+
+            # API Key Input
+            ctk.CTkLabel(c_spectra.content, text="API Key:", font=("Arial", 12), anchor="w").pack(anchor="w",
+                                                                                                  pady=(5, 0))
+            self.entry_spectra_key = ctk.CTkEntry(c_spectra.content, show="*")
+            self.entry_spectra_key.insert(0, self.startup_settings.get("spectra_api_key", ""))
+            self.entry_spectra_key.pack(fill="x", pady=(0, 5))
+            # Base URL
+            ctk.CTkLabel(c_spectra.content, text="Base URL:", font=("Arial", 12), anchor="w").pack(anchor="w")
+            self.entry_spectra_url = ctk.CTkEntry(c_spectra.content)
+            self.entry_spectra_url.insert(0, self.startup_settings.get("spectra_base_url", "https://api.openai.com/v1"))
+            self.entry_spectra_url.pack(fill="x", pady=(0, 5))
+            # Model
+            ctk.CTkLabel(c_spectra.content, text="Model:", font=("Arial", 12), anchor="w").pack(anchor="w")
+            self.entry_spectra_model = ctk.CTkEntry(c_spectra.content)
+            self.entry_spectra_model.insert(0, self.startup_settings.get("spectra_model", "gpt-4o-mini"))
+            self.entry_spectra_model.pack(fill="x", pady=(0, 5))
+
+        def add_elem_row(txt, var_pos_name, var_ord_name):
+            r = ctk.CTkFrame(grid_hf, fg_color="transparent")
+            r.pack(fill="x", pady=2)
+            ctk.CTkLabel(r, text=txt, font=("Arial", 12), width=110, anchor="w").pack(side="left")
+            var_p = ctk.StringVar(value=self.startup_settings.get(var_pos_name, "Hidden"))
+            setattr(self, f"var_{var_pos_name}", var_p)
+            ctk.CTkOptionMenu(r, variable=var_p, values=["Header", "Footer", "Hidden"], width=90, height=22,
+                              font=("Arial", 12), command=self.schedule_update).pack(side="left", padx=5)
+            var_o = ctk.StringVar(value=str(self.startup_settings.get(var_ord_name, 1)))
+            var_o.trace_add("write", lambda *args: self.schedule_update())
+            setattr(self, f"var_{var_ord_name}", var_o)
+            ctk.CTkEntry(r, textvariable=var_o, width=35, height=22).pack(side="right")
+
+        add_elem_row("Chapter Title", "pos_title", "order_title")
+        add_elem_row("Page Number", "pos_pagenum", "order_pagenum")
+        add_elem_row("Chapter Page", "pos_chap_page", "order_chap_page")
+        add_elem_row("Reading %", "pos_percent", "order_percent")
+        self._create_divider_horizontal(c_hf.content)
+        ctk.CTkLabel(c_hf.content, text="Progress Bar", font=("Arial", 12, "bold"), text_color=COLOR_TEXT_GRAY).pack(
+            anchor="w", pady=(10, 2))
+        row_progress = ctk.CTkFrame(c_hf.content, fg_color="transparent")
+        row_progress.pack(fill="x", pady=2)
+        ctk.CTkLabel(row_progress, text="Position:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.var_pos_progress = ctk.StringVar(value=self.startup_settings.get("pos_progress", "Footer (Below Text)"))
+        ctk.CTkOptionMenu(row_progress, variable=self.var_pos_progress,
+                          values=["Header (Above Text)", "Header (Below Text)", "Footer (Above Text)",
+                                  "Footer (Below Text)", "Hidden"], command=self.schedule_update, height=22,
+                          font=("Arial", 12)).pack(side="right", fill="x", expand=True)
+        row_chk = ctk.CTkFrame(c_hf.content, fg_color="transparent")
+        row_chk.pack(fill="x", pady=5)
+        self.var_bar_ticks = ctk.BooleanVar(value=self.startup_settings.get("bar_show_ticks", True))
+        ctk.CTkCheckBox(row_chk, text="Show Ticks", variable=self.var_bar_ticks, command=self.schedule_update,
+                        font=("Arial", 12)).pack(side="left")
+        self.var_bar_marker = ctk.BooleanVar(value=self.startup_settings.get("bar_show_marker", True))
+        ctk.CTkCheckBox(row_chk, text="Show Marker", variable=self.var_bar_marker, command=self.schedule_update,
+                        font=("Arial", 12)).pack(side="right")
+        row_mc = ctk.CTkFrame(c_hf.content, fg_color="transparent")
+        row_mc.pack(fill="x", pady=2)
+        ctk.CTkLabel(row_mc, text="Marker Color:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.var_marker_color = ctk.StringVar(value=self.startup_settings.get("bar_marker_color", "Black"))
+        ctk.CTkOptionMenu(row_mc, variable=self.var_marker_color, values=["Black", "White"], width=90, height=22,
+                          font=("Arial", 12), command=self.schedule_update).pack(side="left", fill="x", expand=True)
+        self._create_slider(c_hf.content, "lbl_marker_size", "Marker Radius", "slider_bar_marker_radius", 2, 10)
+        self._create_slider(c_hf.content, "lbl_tick_height", "Tick Height", "slider_bar_tick_height", 2, 20)
+        self._create_slider(c_hf.content, "lbl_bar_thick", "Bar Thickness", "slider_bar_height", 1, 10)
+        self._create_divider_horizontal(c_hf.content)
+        ctk.CTkLabel(c_hf.content, text="Specific Styles", font=("Arial", 12, "bold"), text_color=COLOR_TEXT_GRAY).pack(
+            anchor="w", pady=(10, 2))
+        f_adv = ctk.CTkFrame(c_hf.content, fg_color="transparent")
+        f_adv.pack(fill="x")
+        align_options = ["Left", "Center", "Right", "Justify"]
+        r_h_align = ctk.CTkFrame(f_adv, fg_color="transparent")
+        r_h_align.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_h_align, text="Header Align:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.var_header_align = ctk.StringVar(value=self.startup_settings.get("header_align", "Center"))
+        ctk.CTkOptionMenu(r_h_align, variable=self.var_header_align, values=align_options, command=self.schedule_update,
+                          height=22, font=("Arial", 12)).pack(side="right", fill="x", expand=True)
+        self._create_slider(f_adv, "lbl_header_size", "Header Font Size", "slider_header_font_size", 8, 30)
+        self._create_slider(f_adv, "lbl_header_margin", "Header Y-Offset", "slider_header_margin", 0, 80)
+        self._create_divider_horizontal(f_adv)
+        r_f_align = ctk.CTkFrame(f_adv, fg_color="transparent")
+        r_f_align.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_f_align, text="Footer Align:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.var_footer_align = ctk.StringVar(value=self.startup_settings.get("footer_align", "Center"))
+        ctk.CTkOptionMenu(r_f_align, variable=self.var_footer_align, values=align_options, command=self.schedule_update,
+                          height=22, font=("Arial", 12)).pack(side="right", fill="x", expand=True)
+        self._create_slider(f_adv, "lbl_footer_size", "Footer Font Size", "slider_footer_font_size", 8, 30)
+        self._create_slider(f_adv, "lbl_footer_margin", "Footer Y-Offset", "slider_footer_margin", 0, 80)
+
+    def _build_preview_area(self):
+        self.preview_frame = ctk.CTkFrame(self.main_container, fg_color="#181818")
+        self.preview_frame.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=10)
+        self.preview_scroll = ctk.CTkScrollableFrame(self.preview_frame, fg_color="transparent")
+        self.preview_scroll.pack(fill="both", expand=True)
         self.preview_scroll._scrollbar.configure(width=0)
-
-        # --- CENTER LOGIC ---
-        # Configure the internal 'canvas' grid to center content
         self.preview_scroll.grid_columnconfigure(0, weight=1)
         self.preview_scroll.grid_rowconfigure(0, weight=1)
+        self.img_label = ctk.CTkLabel(self.preview_scroll, text="Open an EPUB to begin", font=("Arial", 16, "bold"),
+                                      text_color="#333")
+        self.img_label.grid(row=0, column=0, pady=20, padx=20)
+        ctrl_bar = ctk.CTkFrame(self.preview_frame, height=50, fg_color=COLOR_TOOLBAR, corner_radius=15)
+        ctrl_bar.pack(side="bottom", fill="x", padx=20, pady=20)
+        f_nav = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
+        f_nav.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkButton(f_nav, text="◀", width=40, command=self.prev_page, fg_color="#333").pack(side="left", padx=5)
+        f_page_stack = ctk.CTkFrame(f_nav, fg_color="transparent")
+        f_page_stack.pack(side="left", padx=10)
+        self.lbl_page = ctk.CTkLabel(f_page_stack, text="0 / 0", font=("Arial", 14, "bold"), width=80)
+        self.lbl_page.pack(side="top")
+        self.entry_page = ctk.CTkEntry(f_page_stack, width=50, height=20, placeholder_text="#", justify="center",
+                                       font=("Arial", 10))
+        self.entry_page.pack(side="top", pady=(2, 0))
+        self.entry_page.bind('<Return>', lambda e: self.go_to_page())
+        ctk.CTkButton(f_nav, text="▶", width=40, command=self.next_page, fg_color="#333").pack(side="left", padx=5)
+        f_zoom = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
+        f_zoom.pack(side="right", padx=20, pady=10)
+        self._create_slider(f_zoom, "lbl_preview_zoom", "Zoom", "slider_preview_zoom", 200, 800, width=150)
 
-        self.img_label = ctk.CTkLabel(self.preview_scroll, text="Load EPUB to Preview")
-        # Use grid instead of pack to respect the centering weights
-        self.img_label.grid(row=0, column=0, sticky="nsew")
+    def _create_icon_btn(self, parent, text, hover_col, cmd, state="normal"):
+        b = ctk.CTkButton(parent, text=text, command=cmd, state=state, width=110, height=35, corner_radius=8,
+                          font=("Arial", 12, "bold"), fg_color=COLOR_CARD, hover_color=hover_col)
+        b.pack(side="left", padx=5)
+        return b
 
-        # 2. NAVIGATION
-        self.nav = ctk.CTkFrame(self.center_frame, fg_color="transparent")
-        self.nav.pack(side="top", fill="x", pady=(0, 10))
+    def _create_divider(self, parent):
+        ctk.CTkFrame(parent, width=2, height=30, fg_color="#333").pack(side="left", padx=10)
 
-        self.create_slider_group(self.center_frame, "lbl_preview_zoom",
-                                 f"Preview Zoom: {self.startup_settings['preview_zoom']}", "slider_preview_zoom", 200,
-                                 800, self.update_zoom_only, self.startup_settings['preview_zoom'])
+    def _create_divider_horizontal(self, parent):
+        ctk.CTkFrame(parent, height=2, fg_color="#333").pack(fill="x", pady=10)
 
-        nav_inner = ctk.CTkFrame(self.nav, fg_color="transparent")
-        nav_inner.pack()
-        ctk.CTkButton(nav_inner, text="< Prev", width=80, height=30, command=self.prev_page).pack(side="left", padx=20)
+    def _create_slider(self, parent, label_attr, text, slider_attr, min_v, max_v, is_float=False, width=None, trigger_auto_update=True):
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.pack(fill="x", pady=2)
 
-        center_nav_info = ctk.CTkFrame(nav_inner, fg_color="transparent")
-        center_nav_info.pack(side="left", padx=20)
-        self.lbl_page = ctk.CTkLabel(center_nav_info, text="0 / 0", font=("Arial", 14))
-        self.lbl_page.pack()
-        goto_box = ctk.CTkFrame(center_nav_info, fg_color="transparent")
-        goto_box.pack(pady=(2, 0))
-        self.entry_page = ctk.CTkEntry(goto_box, width=50, height=22, placeholder_text="#")
-        self.entry_page.pack(side="left", padx=(0, 5))
-        self.entry_page.bind('<Return>', lambda event: self.go_to_page())
-        ctk.CTkButton(goto_box, text="Go", width=40, height=22, command=self.go_to_page).pack(side="left")
+        setting_key = slider_attr.replace('slider_', '')
+        default_val = self.startup_settings.get(setting_key, min_v)
 
-        ctk.CTkButton(nav_inner, text="Next >", width=80, height=30, command=self.next_page).pack(side="right", padx=20)
+        # Helper to format the label text
+        def get_label_text(val):
+            v_num = float(val) if is_float else int(val)
+            fmt = f"{v_num:.1f}" if is_float else f"{v_num}"
+            return f"{text}: {fmt}"
 
-        # 3. BOTTOM CONTROL BAR
-        self.bottom_bar = ctk.CTkFrame(self.center_frame, height=180, fg_color="#2B2B2B", corner_radius=10)
-        self.bottom_bar.pack(side="bottom", fill="x", padx=10, pady=10)
-        self.bottom_bar.pack_propagate(False)
-
-        self.bottom_bar.grid_columnconfigure(0, weight=1)  # Render (Left)
-        self.bottom_bar.grid_columnconfigure(1, weight=1)  # Actions (Center)
-        self.bottom_bar.grid_columnconfigure(2, weight=1)  # Presets (Right)
-        self.bottom_bar.grid_rowconfigure(0, weight=1)
-
-        # --- LEFT: RENDER OPTIONS ---
-        self.frm_bot_left = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
-        self.frm_bot_left.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-
-        # CONTAINER FOR WIDTH SYNC:
-        # Wraps both the Label/Dropdown AND the Sliders so they share width.
-        self.render_container = ctk.CTkFrame(self.frm_bot_left, fg_color="transparent")
-        self.render_container.pack(anchor="w")
-
-        # Row 1: Label + Dropdown (fill="x")
-        row_mode = ctk.CTkFrame(self.render_container, fg_color="transparent")
-        row_mode.pack(fill="x", pady=(5, 5))
-        ctk.CTkLabel(row_mode, text="Rendering mode:", font=("Arial", 12)).pack(side="left", padx=(0, 10))
-        self.render_mode_var = ctk.StringVar(value=self.startup_settings.get("render_mode", "Threshold"))
-        ctk.CTkOptionMenu(row_mode, values=["Dither", "Threshold"], variable=self.render_mode_var,
-                          width=140, height=28, command=self.toggle_render_controls).pack(side="left")
-
-        # Row 2: Dynamic Sliders Area (fill="x")
-        self.frm_render_dynamic = ctk.CTkFrame(self.render_container, fg_color="transparent")
-        self.frm_render_dynamic.pack(fill="x", expand=True)
-
-        # Group: Dither
-        self.frm_dither = ctk.CTkFrame(self.frm_render_dynamic, fg_color="transparent")
-        # Note: fill="x" is important here to stretch the sliders
-        self.frm_dither.pack(fill="x")
-        self.sld_white = self.create_pixel_slider(self.frm_dither, "lbl_white_clip", "White Clip",
-                                                  "slider_white_clip", 150, 255, 220)
-        self.sld_contrast = self.create_pixel_slider(self.frm_dither, "lbl_contrast", "Contrast",
-                                                     "slider_contrast", 0.5, 2.0, 1.2, is_float=True)
-
-        # Group: Threshold
-        self.frm_thresh = ctk.CTkFrame(self.frm_render_dynamic, fg_color="transparent")
-        self.frm_thresh.pack(fill="x")
-        self.sld_thresh = self.create_pixel_slider(self.frm_thresh, "lbl_threshold", "Threshold",
-                                                   "slider_threshold", 50, 200, 130)
-        self.sld_blur = self.create_pixel_slider(self.frm_thresh, "lbl_blur", "Definition", "slider_blur",
-                                                 0.0, 3.0, 1.0, is_float=True)
-        self.toggle_render_controls()
-
-        # --- CENTER: ACTIONS & PROGRESS ---
-        self.frm_bot_center = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
-        self.frm_bot_center.grid(row=0, column=1, sticky="nsew", padx=5, pady=10)
-
-        self.btn_row = ctk.CTkFrame(self.frm_bot_center, fg_color="transparent")
-        self.btn_row.pack(expand=True)
-
-        ctk.CTkButton(self.btn_row, text="Reset", command=self.reset_to_factory, fg_color="#555", width=70,
-                      height=30).pack(side="left", padx=4)
-        self.btn_run = ctk.CTkButton(self.btn_row, text="Force Refresh", fg_color="gray", width=110, height=30,
-                                     command=self.run_processing)
-        self.btn_run.pack(side="left", padx=4)
-        self.btn_export = ctk.CTkButton(self.btn_row, text="Export XTC", state="disabled", width=110, height=30,
-                                        command=self.export_file)
-        self.btn_export.pack(side="left", padx=4)
-        self.btn_export_cover = ctk.CTkButton(self.btn_row, text="Cover", state="disabled", width=70, height=30,
-                                              command=self.open_cover_export, fg_color="#7B1FA2", hover_color="#4A148C")
-        self.btn_export_cover.pack(side="left", padx=4)
-
-        self.progress_bar = ctk.CTkProgressBar(self.frm_bot_center, height=6)
-        self.progress_bar.set(0)
-        self.progress_bar.pack(fill="x", pady=(10, 2), padx=20)
-        self.progress_label = ctk.CTkLabel(self.frm_bot_center, text="Ready", font=("Arial", 11), text_color="gray")
-        self.progress_label.pack()
-
-        # --- RIGHT: PRESETS (Stick to Right Edge) ---
-        self.frm_bot_right = ctk.CTkFrame(self.bottom_bar, fg_color="transparent")
-        self.frm_bot_right.grid(row=0, column=2, sticky="nsew", padx=10, pady=10)
-
-        # anchor="e" forces the content to the East (Right)
-        self.preset_container = ctk.CTkFrame(self.frm_bot_right, fg_color="transparent")
-        self.preset_container.pack(expand=True, anchor="e")
-
-        # Row 1: Label + Dropdown
-        row_preset_select = ctk.CTkFrame(self.preset_container, fg_color="transparent")
-        row_preset_select.pack(fill="x", pady=(0, 5))
-
-        ctk.CTkLabel(row_preset_select, text="Preset:", font=("Arial", 12)).pack(side="left", padx=(0, 10))
-        self.preset_var = ctk.StringVar(value="Select Preset...")
-        self.preset_dropdown = ctk.CTkOptionMenu(row_preset_select, variable=self.preset_var, values=[],
-                                                 command=self.load_selected_preset, height=28, width=150)
-        self.preset_dropdown.pack(side="left")
-        self.refresh_presets_list()
-
-        # Row 2 & 3: Buttons
-        ctk.CTkButton(self.preset_container, text="Save Preset", command=self.save_new_preset,
-                      height=28, fg_color="green").pack(fill="x", pady=3)
-
-        ctk.CTkButton(self.preset_container, text="Set Default", command=self.save_current_as_default,
-                      height=28, fg_color="#D35400").pack(fill="x", pady=3)
-
-    def _add_section_divider(self, parent):
-        ctk.CTkFrame(parent, height=2, fg_color="#444").pack(fill="x", padx=10, pady=(15, 5))
-
-    # --- SLIDER FOR LAYOUT (Triggers Full Refresh) ---
-    def create_slider_group(self, parent, label_attr, label_text, slider_attr, from_val, to_val, cmd, start_val):
-        lbl = ctk.CTkLabel(parent, text=label_text)
-        lbl.pack(pady=(5, 0), padx=20, anchor="w")
+        lbl = ctk.CTkLabel(f, text=get_label_text(default_val), font=("Arial", 12), anchor="w", width=130)
+        lbl.pack(side="left")
         setattr(self, label_attr, lbl)
 
-        def wrapped_cmd(val):
-            cmd(val)
-            self.schedule_update()
+        # This logic handles the "suppress update" for Spectra sliders
+        def on_slide(val):
+            lbl.configure(text=get_label_text(val))
+            if trigger_auto_update:
+                self.schedule_update()
 
-        sld = ctk.CTkSlider(parent, from_=from_val, to=to_val, command=wrapped_cmd)
-        sld.set(start_val)
-        sld.pack(fill="x", padx=20, pady=5)
-        setattr(self, slider_attr, sld)
+        sld = ctk.CTkSlider(f, from_=min_v, to=max_v, command=on_slide, height=16)
+        if width: sld.configure(width=width)
+        sld.set(default_val)
+        sld.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-    # --- SLIDER FOR PIXELS (Triggers Instant Refresh) ---
-    def create_pixel_slider(self, parent, label_attr, label_text, slider_attr, from_val, to_val, default_val,
-                            is_float=False):
-        lbl = ctk.CTkLabel(parent, text=f"{label_text}: {default_val}")
-        lbl.pack(pady=(2, 0), padx=20, anchor="w")
-        setattr(self, label_attr, lbl)
-
-        def update_lbl_and_refresh(val):
-            v = float(val) if is_float else int(val)
-            lbl.configure(text=f"{label_text}: {v:.1f}" if is_float else f"{label_text}: {v}")
-            # Instant update for pixel filters
-            self.update_render_settings_only()
-
-        sld = ctk.CTkSlider(parent, from_=from_val, to=to_val, command=update_lbl_and_refresh)
-        sld.set(self.startup_settings.get(slider_attr.replace("slider_", ""), default_val))
-        sld.pack(fill="x", padx=20, pady=2)
+        # Store the formatter and slider for the refresh_all_slider_labels method
+        setattr(self, f"fmt_{slider_attr}", get_label_text)
         setattr(self, slider_attr, sld)
         return sld
 
     def toggle_render_controls(self, _=None):
         mode = self.render_mode_var.get()
+
+        # Always hide both first
         self.frm_dither.pack_forget()
         self.frm_thresh.pack_forget()
 
+        # If Dither is selected, show Contrast/White Clip for cleaning gradients
         if mode == "Dither":
             self.frm_dither.pack(fill="x")
-        else:
+        # If Threshold is selected, show Threshold/Blur for text sharpening
+        elif mode == "Threshold":
             self.frm_thresh.pack(fill="x")
 
-        # Trigger instant refresh instead of slow schedule_update
-        self.update_render_settings_only()
-
-    def update_render_settings_only(self):
-        # Updates settings dict and refreshes ONLY the image without re-layout
-        if not self.processor.is_ready: return
-
-        # Update processor settings directly from pixel sliders
-        s = self.processor.layout_settings
-        s["render_mode"] = self.render_mode_var.get()
-        s["white_clip"] = int(self.slider_white_clip.get())
-        s["contrast"] = float(self.slider_contrast.get())
-        s["text_threshold"] = int(self.slider_threshold.get())
-        s["text_blur"] = float(self.slider_blur.get())
-
-        # Refresh current page view immediately
-        self.show_page(self.current_page_index)
-
-    def _create_element_control(self, parent, label_text, key_pos, key_order):
-        f = ctk.CTkFrame(parent, fg_color="transparent")
-        f.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(f, text=label_text).pack(side="left")
-        val_pos = self.startup_settings.get(key_pos, "Hidden")
-        var_pos = ctk.StringVar(value=val_pos)
-        setattr(self, f"var_{key_pos}", var_pos)
-        val_order = str(self.startup_settings.get(key_order, 1))
-        var_order = ctk.StringVar(value=val_order)
-        setattr(self, f"var_{key_order}", var_order)
-        entry_order = ctk.CTkEntry(f, textvariable=var_order, width=30)
-        entry_order.pack(side="right", padx=(5, 0))
-        ctk.CTkOptionMenu(f, variable=var_pos, values=["Header", "Footer", "Hidden"], width=100,
-                          command=self.schedule_update).pack(side="right")
-        ctk.CTkLabel(f, text="Ord:", font=("Arial", 10), text_color="gray").pack(side="right", padx=(10, 2))
-
-    def _create_header_footer_controls(self, parent):
-        self._add_section_divider(parent)
-        ctk.CTkLabel(parent, text="HEADER & FOOTER", font=("Arial", 13, "bold")).pack(pady=(5, 10))
-        self._create_element_control(parent, "Chapter Title:", "pos_title", "order_title")
-        self._create_element_control(parent, "Page Number:", "pos_pagenum", "order_pagenum")
-        self._create_element_control(parent, "Chapter Page (X/Y):", "pos_chap_page", "order_chap_page")
-        self._create_element_control(parent, "Reading %:", "pos_percent", "order_percent")
-        ctk.CTkLabel(parent, text="Progress Bar Settings", font=("Arial", 13, "bold")).pack(pady=(15, 5))
-        f3 = ctk.CTkFrame(parent, fg_color="transparent")
-        f3.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(f3, text="Position:").pack(side="left")
-        self.var_pos_progress = ctk.StringVar(value=self.startup_settings.get("pos_progress", "Footer (Below Text)"))
-        ctk.CTkOptionMenu(f3, variable=self.var_pos_progress,
-                          values=["Header (Above Text)", "Header (Below Text)", "Footer (Above Text)",
-                                  "Footer (Below Text)", "Hidden"], width=160, command=self.schedule_update).pack(
-            side="right")
-        row_checks = ctk.CTkFrame(parent, fg_color="transparent")
-        row_checks.pack(fill="x", padx=20, pady=(10, 10))
-        self.var_bar_ticks = ctk.BooleanVar(value=self.startup_settings.get("bar_show_ticks", True))
-        ctk.CTkCheckBox(row_checks, text="Show Ticks", variable=self.var_bar_ticks, command=self.schedule_update,
-                        width=100).pack(side="left")
-        self.var_bar_marker = ctk.BooleanVar(value=self.startup_settings.get("bar_show_marker", True))
-        ctk.CTkCheckBox(row_checks, text="Show Marker", variable=self.var_bar_marker,
-                        command=self.schedule_update).pack(side="right", padx=(10, 0), pady=10)
-        f4 = ctk.CTkFrame(parent, fg_color="transparent")
-        f4.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(f4, text="Marker Color:").pack(side="left")
-        self.var_marker_color = ctk.StringVar(value=self.startup_settings.get("bar_marker_color", "Black"))
-        ctk.CTkOptionMenu(f4, variable=self.var_marker_color, values=["Black", "White"], width=100,
-                          command=self.schedule_update).pack(side="right")
-        self.create_slider_group(parent, "lbl_bar_thick", f"Bar Thickness: {self.startup_settings['bar_height']}px",
-                                 "slider_bar_thick", 1, 10, self.update_bar_thick_label,
-                                 self.startup_settings.get('bar_height', 4))
-        self.create_slider_group(parent, "lbl_marker_size",
-                                 f"Marker Radius: {self.startup_settings['bar_marker_radius']}px", "slider_marker_size",
-                                 2, 10,
-                                 lambda v: self.update_generic_label("lbl_marker_size", f"Marker Radius: {int(v)}px"),
-                                 self.startup_settings.get('bar_marker_radius', 5))
-        self.create_slider_group(parent, "lbl_tick_height",
-                                 f"Tick Height: {self.startup_settings['bar_tick_height']}px", "slider_tick_height", 2,
-                                 20, lambda v: self.update_generic_label("lbl_tick_height", f"Tick Height: {int(v)}px"),
-                                 self.startup_settings.get('bar_tick_height', 6))
-        ctk.CTkLabel(parent, text="Header Styles", font=("Arial", 13, "bold")).pack(pady=(15, 5))
-        h_align = ctk.CTkFrame(parent, fg_color="transparent")
-        h_align.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(h_align, text="Alignment:").pack(side="left")
-        self.var_header_align = ctk.StringVar(value=self.startup_settings.get("header_align", "Center"))
-        ctk.CTkOptionMenu(h_align, variable=self.var_header_align, values=["Left", "Center", "Right", "Justify"],
-                          width=100, command=self.schedule_update).pack(side="right")
-        self.create_slider_group(parent, "lbl_header_size", f"Font Size: {self.startup_settings['header_font_size']}",
-                                 "slider_header_size", 8, 30,
-                                 lambda v: self.update_generic_label("lbl_header_size", f"Font Size: {int(v)}"),
-                                 self.startup_settings.get('header_font_size', 16))
-        self.create_slider_group(parent, "lbl_header_margin",
-                                 f"Header Y-Offset: {self.startup_settings['header_margin']}px", "slider_header_margin",
-                                 0, 80, lambda v: self.update_generic_label("lbl_header_margin",
-                                                                            f"Header Y-Offset: {int(v)}px"),
-                                 self.startup_settings.get('header_margin', 10))
-        ctk.CTkLabel(parent, text="Footer Styles", font=("Arial", 13, "bold")).pack(pady=(15, 5))
-        f_align = ctk.CTkFrame(parent, fg_color="transparent")
-        f_align.pack(fill="x", padx=20, pady=2)
-        ctk.CTkLabel(f_align, text="Alignment:").pack(side="left")
-        self.var_footer_align = ctk.StringVar(value=self.startup_settings.get("footer_align", "Center"))
-        ctk.CTkOptionMenu(f_align, variable=self.var_footer_align, values=["Left", "Center", "Right", "Justify"],
-                          width=100, command=self.schedule_update).pack(side="right")
-        self.create_slider_group(parent, "lbl_footer_size", f"Font Size: {self.startup_settings['footer_font_size']}",
-                                 "slider_footer_size", 8, 30,
-                                 lambda v: self.update_generic_label("lbl_footer_size", f"Font Size: {int(v)}"),
-                                 self.startup_settings.get('footer_font_size', 16))
-        self.create_slider_group(parent, "lbl_footer_margin",
-                                 f"Footer Y-Offset: {self.startup_settings['footer_margin']}px", "slider_footer_margin",
-                                 0, 80, lambda v: self.update_generic_label("lbl_footer_margin",
-                                                                            f"Footer Y-Offset: {int(v)}px"),
-                                 self.startup_settings.get('footer_margin', 10))
-
-    def gather_current_ui_settings(self):
-        def get_order(var_name):
-            try:
-                return int(getattr(self, var_name).get())
-            except:
-                return 99
-
-        settings = {
-            "font_size": int(self.slider_size.get()),
-            "font_weight": int(self.slider_weight.get()),
-            "line_height": float(self.slider_line.get()),
-            "margin": int(self.slider_margin.get()),
-            "top_padding": int(self.slider_top_padding.get()),
-            "bottom_padding": int(self.slider_padding.get()),
-            "orientation": self.orientation_var.get(),
-            "text_align": self.align_dropdown.get(),
-            "font_name": self.font_dropdown.get(),
-            "preview_zoom": int(self.slider_preview_zoom.get()),
-            "generate_toc": self.var_toc.get(),
-            "show_footnotes": self.var_footnotes.get(),
-            "bar_height": int(self.slider_bar_thick.get()),
-            "pos_title": self.var_pos_title.get(),
-            "pos_pagenum": self.var_pos_pagenum.get(),
-            "pos_chap_page": self.var_pos_chap_page.get(),
-            "pos_percent": self.var_pos_percent.get(),
-            "pos_progress": self.var_pos_progress.get(),
-            "order_title": get_order("var_order_title"),
-            "order_pagenum": get_order("var_order_pagenum"),
-            "order_chap_page": get_order("var_order_chap_page"),
-            "order_percent": get_order("var_order_percent"),
-            "bar_show_ticks": self.var_bar_ticks.get(),
-            "bar_show_marker": self.var_bar_marker.get(),
-            "bar_marker_color": self.var_marker_color.get(),
-            "bar_marker_radius": int(self.slider_marker_size.get()),
-            "bar_tick_height": int(self.slider_tick_height.get()),
-            "header_align": self.var_header_align.get(),
-            "header_font_size": int(self.slider_header_size.get()),
-            "header_margin": int(self.slider_header_margin.get()),
-            "footer_align": self.var_footer_align.get(),
-            "footer_font_size": int(self.slider_footer_size.get()),
-            "footer_margin": int(self.slider_footer_margin.get()),
-
-            # --- NEW KEYS ---
-            "render_mode": self.render_mode_var.get(),
-            "white_clip": int(self.slider_white_clip.get()),
-            "contrast": float(self.slider_contrast.get()),
-            "text_threshold": int(self.slider_threshold.get()),
-            "text_blur": float(self.slider_blur.get()),
-        }
-        return settings
-
-    def apply_settings_dict(self, s):
-        defaults = FACTORY_DEFAULTS.copy()
-        defaults.update(s)
-        s = defaults
-        self.slider_size.set(s['font_size'])
-        self.slider_weight.set(s['font_weight'])
-        self.slider_line.set(s['line_height'])
-        self.slider_margin.set(s['margin'])
-        self.slider_top_padding.set(s['top_padding'])
-        self.slider_padding.set(s['bottom_padding'])
-        self.orientation_var.set(s['orientation'])
-        self.align_dropdown.set(s['text_align'])
-        self.slider_preview_zoom.set(s['preview_zoom'])
-        self.var_toc.set(s['generate_toc'])
-        self.var_footnotes.set(s.get('show_footnotes', True))
-        self.slider_bar_thick.set(s['bar_height'])
-        self.var_pos_title.set(s['pos_title'])
-        self.var_pos_pagenum.set(s['pos_pagenum'])
-        self.var_pos_chap_page.set(s['pos_chap_page'])
-        self.var_pos_percent.set(s['pos_percent'])
-        self.var_pos_progress.set(s['pos_progress'])
-        self.var_order_title.set(str(s['order_title']))
-        self.var_order_pagenum.set(str(s['order_pagenum']))
-        self.var_order_chap_page.set(str(s['order_chap_page']))
-        self.var_order_percent.set(str(s['order_percent']))
-        self.var_bar_ticks.set(s['bar_show_ticks'])
-        self.var_bar_marker.set(s['bar_show_marker'])
-        self.var_marker_color.set(s['bar_marker_color'])
-        self.slider_marker_size.set(s['bar_marker_radius'])
-        self.slider_tick_height.set(s['bar_tick_height'])
-        self.var_header_align.set(s['header_align'])
-        self.slider_header_size.set(s['header_font_size'])
-        self.slider_header_margin.set(s['header_margin'])
-        self.var_footer_align.set(s['footer_align'])
-        self.slider_footer_size.set(s['footer_font_size'])
-        self.slider_footer_margin.set(s['footer_margin'])
-
-        # --- NEW KEYS ---
-        self.render_mode_var.set(s.get("render_mode", "Threshold"))
-        self.slider_white_clip.set(s.get("white_clip", 220))
-        self.slider_contrast.set(s.get("contrast", 1.2))
-        self.slider_threshold.set(s.get("text_threshold", 130))
-        self.slider_blur.set(s.get("text_blur", 1.0))
-
-        # Update text labels
-        self.lbl_white_clip.configure(text=f"White Clipping: {int(s.get('white_clip', 220))}")
-        self.lbl_contrast.configure(text=f"Contrast Boost: {s.get('contrast', 1.2):.1f}")
-        self.lbl_threshold.configure(text=f"Contrast Threshold: {int(s.get('text_threshold', 130))}")
-        self.lbl_blur.configure(text=f"Definition: {s.get('text_blur', 1.0):.1f}")
-
-        if s["font_name"] in self.font_options:
-            self.font_dropdown.set(s["font_name"])
-            self.processor.font_path = self.font_map[s["font_name"]]
-        else:
-            self.font_dropdown.set("Default (System)")
-            self.processor.font_path = self.font_map["Default (System)"]
-        self.update_size_label(s['font_size'])
-        self.update_weight_label(s['font_weight'])
-        self.update_line_label(s['line_height'])
-        self.update_margin_label(s['margin'])
-        self.update_top_padding_label(s['top_padding'])
-        self.update_padding_label(s['bottom_padding'])
-        self.update_zoom_only(s['preview_zoom'])
-        self.update_bar_thick_label(s['bar_height'])
-        self.update_generic_label("lbl_header_size", f"Font Size: {s['header_font_size']}")
-        self.update_generic_label("lbl_header_margin", f"Header Y-Offset: {s['header_margin']}px")
-        self.update_generic_label("lbl_footer_size", f"Font Size: {s['footer_font_size']}")
-        self.update_generic_label("lbl_footer_margin", f"Footer Y-Offset: {s['footer_margin']}px")
-        self.update_generic_label("lbl_marker_size", f"Marker Radius: {s['bar_marker_radius']}px")
-        self.update_generic_label("lbl_tick_height", f"Tick Height: {s['bar_tick_height']}px")
-
-        self.toggle_render_controls()
         self.schedule_update()
-
-    def update_size_label(self, value):
-        self.lbl_size.configure(text=f"Font Size: {int(value)}pt")
-
-    def update_weight_label(self, value):
-        self.lbl_weight.configure(text=f"Font Weight: {int(value)}")
-
-    def update_line_label(self, value):
-        self.lbl_line.configure(text=f"Line Height: {value:.1f}")
-
-    def update_margin_label(self, value):
-        self.lbl_margin.configure(text=f"Margin: {int(value)}px")
-
-    def update_padding_label(self, value):
-        self.lbl_padding.configure(text=f"Bottom Padding: {int(value)}px")
-
-    def update_top_padding_label(self, value):
-        self.lbl_top_padding.configure(text=f"Top Padding: {int(value)}px")
-
-    def update_bar_thick_label(self, value):
-        self.lbl_bar_thick.configure(text=f"Bar Thickness: {int(value)}px")
-
-    def update_zoom_only(self, value):
-        self.lbl_preview_zoom.configure(text=f"Preview Zoom: {int(value)}")
-
-    def update_generic_label(self, attr_name, text):
-        getattr(self, attr_name).configure(text=text)
-
-    def on_font_change(self, choice):
-        self.processor.font_path = self.font_map[choice]
-        self.schedule_update()
-
-    def load_startup_defaults(self):
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r") as f:
-                    saved = json.load(f)
-                    self.startup_settings.update(saved)
-            except:
-                pass
-
-    def save_current_as_default(self):
-        data = self.gather_current_ui_settings()
-        try:
-            with open(SETTINGS_FILE, "w") as f:
-                json.dump(data, f, indent=4)
-            messagebox.showinfo("Saved", "Current settings saved as startup default.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not save settings: {e}")
-
-    def refresh_presets_list(self):
-        files = glob.glob(os.path.join(PRESETS_DIR, "*.json"))
-        names = [os.path.basename(f).replace(".json", "") for f in files]
-        names.sort()
-        if not names:
-            self.preset_dropdown.configure(values=["No Presets"])
-            self.preset_var.set("No Presets")
-        else:
-            self.preset_dropdown.configure(values=names)
-            self.preset_var.set("Select Preset...")
-
-    def save_new_preset(self):
-        name = simpledialog.askstring("New Preset", "Enter a name for this preset:")
-        if not name: return
-        safe_name = "".join(x for x in name if x.isalnum() or x in " -_")
-        path = os.path.join(PRESETS_DIR, f"{safe_name}.json")
-        data = self.gather_current_ui_settings()
-        try:
-            with open(path, "w") as f:
-                json.dump(data, f, indent=4)
-            self.refresh_presets_list()
-            self.preset_var.set(safe_name)
-            messagebox.showinfo("Success", f"Preset '{safe_name}' saved.")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def load_selected_preset(self, choice):
-        if choice == "No Presets" or choice == "Select Preset...": return
-        path = os.path.join(PRESETS_DIR, f"{choice}.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r") as f:
-                    data = json.load(f)
-                self.apply_settings_dict(data)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to load preset: {e}")
-
-    def reset_to_factory(self):
-        if messagebox.askyesno("Confirm", "Reset everything to Factory Defaults?"): self.apply_settings_dict(
-            FACTORY_DEFAULTS)
 
     def select_file(self):
         path = filedialog.askopenfilename(filetypes=[("EPUB", "*.epub")])
@@ -1792,7 +2304,7 @@ class App(ctk.CTk):
             self.processor.input_file = path
             self.current_page_index = 0
             self.lbl_file.configure(text=os.path.basename(path))
-            self.progress_label.configure(text="Parsing structure...")
+            self.progress_label.configure(text="Parsing...")
             threading.Thread(target=self._task_parse_structure).start()
 
     def _task_parse_structure(self):
@@ -1803,7 +2315,7 @@ class App(ctk.CTk):
         if not success:
             messagebox.showerror("Error", "Failed to parse EPUB.")
             return
-        self.btn_chapters.configure(state="normal", fg_color="#3B8ED0")
+        self.btn_chapters.configure(state="normal")
         self.open_chapter_dialog()
 
     def open_chapter_dialog(self):
@@ -1815,43 +2327,75 @@ class App(ctk.CTk):
         self.selected_chapter_indices = selected_indices
         self.run_processing()
 
-    def schedule_update(self, _=None):
-        if not self.processor.input_file: return
+    def run_spectra_analysis(self):
+        """Manually trigger API Analysis with Regenerate Option"""
+        if not self.processor.input_file or not self.selected_chapter_indices: return
+        if not self.entry_spectra_key.get():
+            messagebox.showerror("Missing Key", "Please enter an OpenAI API Key.")
+            return
 
-        # FIXED: Check if self.timer is valid before cancelling
-        if self.debounce_timer is not None:
-            try:
-                self.after_cancel(self.debounce_timer)
-            except ValueError:
-                pass
+        # NEW LOGIC: Ask user if they want to force regenerate
+        force_regen = False
 
-        self.progress_label.configure(text="Waiting for changes...")
-        self.debounce_timer = self.after(800, self.run_processing)
+        # Check if we already have some definitions in memory
+        has_cache = hasattr(self.processor.annotator, 'master_cache') and bool(self.processor.annotator.master_cache)
 
-    def update_progress_ui(self, val, stage_text="Processing"):
-        self.after(0, lambda: self.progress_bar.set(val))
-        self.after(0, lambda: self.progress_label.configure(text=f"{stage_text}: {int(val * 100)}%"))
+        if has_cache:
+            # Ask the user
+            ans = messagebox.askyesnocancel("Regenerate Annotations?",
+                                            "Definitions already exist.\n\n"
+                                            "Yes = Force Regenerate ALL (Overwrites existing, uses more API credits)\n"
+                                            "No = Only Scan for Missing words (Cheaper)\n"
+                                            "Cancel = Stop")
+            if ans is None:
+                return  # Cancelled
+            if ans:
+                force_regen = True
+
+        self.is_processing = True
+        self.progress_label.configure(text="Scanning Words...")
+        settings = self.gather_current_ui_settings()
+
+        # Pass the force_regen flag to the task
+        threading.Thread(target=lambda: self._task_analyze(settings, force_regen)).start()
+
+    def _task_analyze(self, layout_settings, force=False):
+        # Init annotator with current settings
+        self.processor.init_annotator(layout_settings)
+
+        # Run scanning/fetching with FORCE flag
+        self.processor.annotator.analyze_chapters(
+            self.processor.raw_chapters,
+            self.selected_chapter_indices,
+            progress_callback=lambda v: self.update_progress_ui(v, "Analyzing"),
+            force=force  # <--- Passed here
+        )
+
+        # After analysis, re-render the layout to apply new cache
+        self.after(0, self.run_processing)
 
     def run_processing(self):
         if not self.processor.input_file: return
-        if self.is_processing: return
-        if self.selected_chapter_indices is None: self.selected_chapter_indices = list(
-            range(len(self.processor.raw_chapters)))
-        layout_settings = self.gather_current_ui_settings()
+
         self.is_processing = True
-        self.btn_run.configure(state="disabled", text="Rendering...", fg_color="orange")
-        self.progress_label.configure(text="Starting layout...")
-        threading.Thread(target=lambda: self._task_render(layout_settings)).start()
+        self.pending_rerun = False  # We are starting the latest job now
+
+        self.progress_label.configure(text="Rendering Layout...")
+
+        # Gather settings NOW (so we get the very latest slider values)
+        settings = self.gather_current_ui_settings()
+
+        threading.Thread(target=lambda: self._task_render(settings)).start()
 
     def _task_render(self, layout_settings):
         success = self.processor.render_chapters(
             self.selected_chapter_indices,
             self.processor.font_path,
-            int(self.slider_size.get()),
+            int(self.slider_font_size.get()),
             int(self.slider_margin.get()),
-            float(self.slider_line.get()),
-            int(self.slider_weight.get()),
-            int(self.slider_padding.get()),
+            float(self.slider_line_height.get()),
+            int(self.slider_font_weight.get()),
+            int(self.slider_bottom_padding.get()),
             int(self.slider_top_padding.get()),
             text_align=self.align_dropdown.get(),
             orientation=self.orientation_var.get(),
@@ -1864,21 +2408,37 @@ class App(ctk.CTk):
 
     def _done(self, success):
         self.is_processing = False
-        self.btn_run.configure(state="normal", text="Force Refresh", fg_color="green")
+
+        # CHECK IF A NEW CHANGE CAME IN WHILE WE WERE WORKING
+        if self.pending_rerun:
+            # Recursive restart: Run again immediately with the new settings
+            self.after(10, self.run_processing)
+            return
+
+        # Normal finish
+        self.progress_label.configure(text="Ready")
+        self.progress_bar.set(0)
+
         if success:
             self.btn_export.configure(state="normal")
-            self.btn_export_cover.configure(state="normal")
-            old_idx = self.current_page_index
-            total = self.processor.total_pages
-            new_idx = min(old_idx, total - 1)
-            self.show_page(new_idx)
+            self.btn_cover.configure(state="normal")
+            self.show_page(self.current_page_index)
         else:
             messagebox.showerror("Error", "Processing failed.")
 
+    def update_progress_ui(self, val, stage_text="Processing"):
+        try:
+            # Check if the widget still exists before trying to update it
+            if not self.winfo_exists(): return
+
+            self.after(0, lambda: [
+                self.progress_bar.set(val),
+                self.progress_label.configure(text=f"{stage_text} {int(val * 100)}%")
+            ])
+        except:
+            pass
+
     def show_page(self, idx):
-        # Safety: check if img_label exists and processor is ready
-        if not hasattr(self, 'img_label') or not self.processor.is_ready:
-            return
         if not self.processor.is_ready: return
         self.current_page_index = idx
         img = self.processor.render_page(idx)
@@ -1893,24 +2453,22 @@ class App(ctk.CTk):
             target_h = int(target_w * aspect_ratio)
         ctk_img = ctk.CTkImage(light_image=img, size=(target_w, target_h))
         self.img_label.configure(image=ctk_img, text="")
-        # Ensure it stays centered
-        self.img_label.grid(row=0, column=0, sticky="nsew")
-        self.lbl_page.configure(text=f"Page {idx + 1} / {self.processor.total_pages}")
-
-    def go_to_page(self):
-        if not self.processor.is_ready: return
-        txt = self.entry_page.get()
-        if not txt.isdigit(): return
-        target = int(txt)
-        target = max(1, min(target, self.processor.total_pages))
-        self.show_page(target - 1)
-        self.entry_page.delete(0, 'end')
+        self.lbl_page.configure(text=f"{idx + 1} / {self.processor.total_pages}")
+        self.preview_scroll.update_idletasks()
 
     def prev_page(self):
         self.show_page(max(0, self.current_page_index - 1))
 
     def next_page(self):
         self.show_page(min(self.processor.total_pages - 1, self.current_page_index + 1))
+
+    def go_to_page(self):
+        try:
+            target = int(self.entry_page.get())
+            self.show_page(max(0, min(target - 1, self.processor.total_pages - 1)))
+        except:
+            pass
+        self.entry_page.delete(0, 'end')
 
     def export_file(self):
         path = filedialog.asksaveasfilename(defaultextension=".xtc")
@@ -1921,15 +2479,14 @@ class App(ctk.CTk):
         self.after(0, lambda: messagebox.showinfo("Success", "XTC file saved."))
 
     def open_cover_export(self):
-        if not self.processor.cover_image_obj:
-            messagebox.showinfo("Info", "No cover image found in this book.")
-            return
-        CoverExportDialog(self, self._process_cover_export)
+        if self.processor.cover_image_obj:
+            CoverExportDialog(self, self._process_cover_export)
+        else:
+            messagebox.showinfo("Info", "No cover found.")
 
     def _process_cover_export(self, w, h, mode):
         path = filedialog.asksaveasfilename(defaultextension=".bmp", filetypes=[("Bitmap", "*.bmp")])
-        if not path: return
-        threading.Thread(target=lambda: self._run_cover_export(path, w, h, mode)).start()
+        if path: threading.Thread(target=lambda: self._run_cover_export(path, w, h, mode)).start()
 
     def _run_cover_export(self, path, w, h, mode):
         try:
@@ -1947,11 +2504,231 @@ class App(ctk.CTk):
             img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
             img.save(path, format="BMP")
             self.update_progress_ui(1.0, "Done")
-            self.after(0, lambda: messagebox.showinfo("Success", f"Cover saved to {os.path.basename(path)}"))
+            self.after(0, lambda: messagebox.showinfo("Success", "Cover saved."))
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Error", f"Failed to export cover: {e}"))
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+    def schedule_update(self, _=None):
+        if not self.processor.input_file: return
+
+        # Immediate visual feedback
+        self.progress_label.configure(text="Pending changes...")
+
+        # Cancel previous timer if it exists (standard debounce)
+        if self.debounce_timer:
+            try:
+                self.after_cancel(self.debounce_timer)
+            except:
+                pass
+
+        # Wait 500ms (increased from 200ms for stability)
+        self.debounce_timer = self.after(500, self.trigger_processing)
+
+    def trigger_processing(self):
+        if self.is_processing:
+            # If busy, mark that we need to run again as soon as we finish
+            self.pending_rerun = True
+            return
+
+        self.run_processing()
+
+    def gather_current_ui_settings(self):
+        def get_order(var_name):
+            try:
+                return int(getattr(self, var_name).get())
+            except:
+                return 99
+
+        spectra_en = self.var_spectra_enabled.get() if hasattr(self, 'var_spectra_enabled') else False
+        spectra_key = self.entry_spectra_key.get() if hasattr(self, 'entry_spectra_key') else ""
+        spectra_url = self.entry_spectra_url.get() if hasattr(self, 'entry_spectra_url') else ""
+        spectra_model = self.entry_spectra_model.get() if hasattr(self, 'entry_spectra_model') else ""
+        spectra_thresh = float(self.slider_spectra_threshold.get()) if hasattr(self, 'slider_spectra_threshold') else 4.0
+        # NEW AoA
+        spectra_aoa = float(self.slider_spectra_aoa_threshold.get()) if hasattr(self, 'slider_spectra_aoa_threshold') else 0.0
+        spectra_lang = self.var_spectra_lang.get() if hasattr(self, 'var_spectra_lang') else "English"
+
+        return {
+            "font_size": int(self.slider_font_size.get()),
+            "font_weight": int(self.slider_font_weight.get()),
+            "line_height": float(self.slider_line_height.get()),
+            "margin": int(self.slider_margin.get()),
+            "top_padding": int(self.slider_top_padding.get()),
+            "bottom_padding": int(self.slider_bottom_padding.get()),
+            "orientation": self.orientation_var.get(),
+            "text_align": self.align_dropdown.get(),
+            "font_name": self.font_dropdown.get(),
+            "preview_zoom": int(self.slider_preview_zoom.get()),
+            "generate_toc": self.var_toc.get(),
+            "show_footnotes": self.var_footnotes.get(),
+            "bar_height": int(self.slider_bar_height.get()),
+            "pos_title": self.var_pos_title.get(),
+            "pos_pagenum": self.var_pos_pagenum.get(),
+            "pos_chap_page": self.var_pos_chap_page.get(),
+            "pos_percent": self.var_pos_percent.get(),
+            "pos_progress": self.var_pos_progress.get(),
+            "order_title": get_order("var_order_title"),
+            "order_pagenum": get_order("var_order_pagenum"),
+            "order_chap_page": get_order("var_order_chap_page"),
+            "order_percent": get_order("var_order_percent"),
+            "bar_show_ticks": self.var_bar_ticks.get(),
+            "bar_show_marker": self.var_bar_marker.get(),
+            "bar_marker_color": self.var_marker_color.get(),
+            "bar_marker_radius": int(self.slider_bar_marker_radius.get()),
+            "bar_tick_height": int(self.slider_bar_tick_height.get()),
+            "header_align": self.var_header_align.get(),
+            "header_font_size": int(self.slider_header_font_size.get()),
+            "header_margin": int(self.slider_header_margin.get()),
+            "footer_align": self.var_footer_align.get(),
+            "footer_font_size": int(self.slider_footer_font_size.get()),
+            "footer_margin": int(self.slider_footer_margin.get()),
+            "render_mode": self.render_mode_var.get(),
+            "bit_depth": self.bit_depth_var.get(),  # Critical: 1-bit vs 2-bit
+            "white_clip": int(self.slider_white_clip.get()),
+            "contrast": float(self.slider_contrast.get()),
+            "text_threshold": int(self.slider_text_threshold.get()),
+            "text_blur": float(self.slider_text_blur.get()),
+
+            # Spectra
+            "spectra_enabled": spectra_en,
+            "spectra_api_key": spectra_key,
+            "spectra_base_url": spectra_url,
+            "spectra_model": spectra_model,
+            "spectra_threshold": spectra_thresh,
+            "spectra_aoa_threshold": spectra_aoa,  # NEW
+            "spectra_target_lang": spectra_lang,
+        }
+
+    def load_startup_defaults(self):
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r") as f:
+                    self.startup_settings.update(json.load(f))
+            except:
+                pass
+
+    def refresh_presets_list(self):
+        files = glob.glob(os.path.join(PRESETS_DIR, "*.json"))
+        names = [os.path.basename(f).replace(".json", "") for f in files]
+        names.sort()
+        self.preset_dropdown.configure(values=names if names else ["No Presets"])
+
+    def load_selected_preset(self, choice):
+        if choice in ["No Presets", "Select Preset..."]: return
+        path = os.path.join(PRESETS_DIR, f"{choice}.json")
+        if os.path.exists(path):
+            with open(path, "r") as f: self.apply_settings_dict(json.load(f))
+
+    def save_new_preset(self):
+        name = simpledialog.askstring("New Preset", "Name:")
+        if name:
+            safe = "".join(x for x in name if x.isalnum() or x in " -_")
+            with open(os.path.join(PRESETS_DIR, f"{safe}.json"), "w") as f:
+                json.dump(self.gather_current_ui_settings(), f, indent=4)
+            self.refresh_presets_list()
+            self.preset_var.set(safe)
+
+    def save_current_as_default(self):
+        with open(SETTINGS_FILE, "w") as f: json.dump(self.gather_current_ui_settings(), f, indent=4)
+        messagebox.showinfo("Saved", "Settings saved as default.")
+
+    def reset_to_factory(self):
+        if messagebox.askyesno("Reset", "Reset to factory settings?"): self.apply_settings_dict(FACTORY_DEFAULTS)
+
+    def apply_settings_dict(self, s):
+        defaults = FACTORY_DEFAULTS.copy()
+        defaults.update(s)
+        s = defaults
+
+        # --- Standard Sliders & Dropdowns ---
+        self.bit_depth_var.set(s.get("bit_depth", "1-bit (XTG)"))
+        self.slider_font_size.set(s['font_size'])
+        self.slider_font_weight.set(s['font_weight'])
+        self.slider_line_height.set(s['line_height'])
+        self.slider_margin.set(s['margin'])
+        self.slider_top_padding.set(s['top_padding'])
+        self.slider_bottom_padding.set(s['bottom_padding'])
+        self.orientation_var.set(s['orientation'])
+        self.align_dropdown.set(s['text_align'])
+        self.slider_preview_zoom.set(s['preview_zoom'])
+        self.var_toc.set(s['generate_toc'])
+        self.var_footnotes.set(s.get('show_footnotes', True))
+        self.slider_bar_height.set(s['bar_height'])
+
+        # --- Header/Footer/Progress ---
+        self.var_pos_title.set(s['pos_title'])
+        self.var_pos_pagenum.set(s['pos_pagenum'])
+        self.var_pos_chap_page.set(s['pos_chap_page'])
+        self.var_pos_percent.set(s['pos_percent'])
+        self.var_pos_progress.set(s['pos_progress'])
+        self.var_order_title.set(str(s['order_title']))
+        self.var_order_pagenum.set(str(s['order_pagenum']))
+        self.var_order_chap_page.set(str(s['order_chap_page']))
+        self.var_order_percent.set(str(s['order_percent']))
+        self.var_bar_ticks.set(s['bar_show_ticks'])
+        self.var_bar_marker.set(s['bar_show_marker'])
+        self.var_marker_color.set(s['bar_marker_color'])
+        self.slider_bar_marker_radius.set(s['bar_marker_radius'])
+        self.slider_bar_tick_height.set(s['bar_tick_height'])
+        self.var_header_align.set(s['header_align'])
+        self.slider_header_font_size.set(s['header_font_size'])
+        self.slider_header_margin.set(s['header_margin'])
+        self.var_footer_align.set(s['footer_align'])
+        self.slider_footer_font_size.set(s['footer_font_size'])
+        self.slider_footer_margin.set(s['footer_margin'])
+
+        # --- Rendering ---
+        self.render_mode_var.set(s.get("render_mode", "Threshold"))
+        self.slider_white_clip.set(s.get("white_clip", 220))
+        self.slider_contrast.set(s.get("contrast", 1.2))
+        self.slider_text_threshold.set(s.get("text_threshold", 130))
+        self.slider_text_blur.set(s.get("text_blur", 1.0))
+
+        # --- SPECTRA AI SETTINGS (FIXED) ---
+        if hasattr(self, 'var_spectra_enabled'):
+            self.var_spectra_enabled.set(s.get('spectra_enabled', False))
+
+        if hasattr(self, 'slider_spectra_threshold'):
+            self.slider_spectra_threshold.set(s.get('spectra_threshold', 4.0))
+
+        if hasattr(self, 'slider_spectra_aoa_threshold'):
+            self.slider_spectra_aoa_threshold.set(s.get('spectra_aoa_threshold', 0.0))
+
+        # FIX: Explicitly update the text entry fields
+        if hasattr(self, 'entry_spectra_key'):
+            self.entry_spectra_key.delete(0, 'end')
+            self.entry_spectra_key.insert(0, s.get('spectra_api_key', ""))
+
+        if hasattr(self, 'entry_spectra_url'):
+            self.entry_spectra_url.delete(0, 'end')
+            self.entry_spectra_url.insert(0, s.get('spectra_base_url', "https://api.openai.com/v1"))
+
+        if hasattr(self, 'entry_spectra_model'):
+            self.entry_spectra_model.delete(0, 'end')
+            self.entry_spectra_model.insert(0, s.get('spectra_model', "gpt-4o-mini"))
+
+        if hasattr(self, 'var_spectra_lang'):
+            self.var_spectra_lang.set(s.get('spectra_target_lang', "English"))
+
+        # --- Final UI Refresh ---
+        self.refresh_all_slider_labels()
+
+        # Handle Font Change
+        if s["font_name"] in self.font_options:
+            self.font_dropdown.set(s["font_name"])
+            self.processor.font_path = self.font_map[s["font_name"]]
+        else:
+            self.font_dropdown.set("Default (System)")
+            self.processor.font_path = self.font_map["Default (System)"]
+
+        self.toggle_render_controls()
+        self.schedule_update()
+
+    def on_font_change(self, choice):
+        self.processor.font_path = self.font_map[choice]
+        self.schedule_update()
 
 
 if __name__ == "__main__":
-    app = App()
+    app = ModernApp()
     app.mainloop()
