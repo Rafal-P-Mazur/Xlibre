@@ -17,8 +17,8 @@ A powerful GUI-based tool designed to convert standard `.epub` files into the bi
 * **Inline Footnotes:** Automatically renders internal references directly below the text block, eliminating the need for page-jumping.
 * **Cover Optimization:** Built-in utility to resize, crop, and dither covers into high-quality e-ink bitmaps.
 
-![App Screenshot 1](images/xtc.png)
-![App Screenshot 2](images/xtc2.png)
+![App Screenshot 1](images/1.png)
+![App Screenshot 2](images/2.png)
 
 ## 📥 Installation
 
