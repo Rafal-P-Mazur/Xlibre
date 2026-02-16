@@ -2153,6 +2153,14 @@ class EpubProcessor:
 
             img_rgb = self.render_page(i)
             img_gray = img_rgb.convert("L")
+
+            # --- FIX: ROTATE PIXELS FOR LANDSCAPE MODE ---
+            if self.layout_settings.get("orientation") == "Landscape":
+                # Rotate 90 degrees clockwise (or -90 for counter-clockwise)
+                # expand=True swaps the dimensions from 800x480 back to 480x800
+                img_gray = img_gray.rotate(90, expand=True)
+            # ---------------------------------------------
+
             w, h = img_gray.size
 
             if is_2bit:
