@@ -1,8 +1,8 @@
-# Xlibre Library Manager & Converter
+# Xalibre Library Manager & Converter
 
-**Xlibre** is a comprehensive e-book management tool designed to organize your EPUB library, fetch metadata, edit book details, and convert files into the optimized **XTC** format for e-ink devices (specifically the Xteink X4).
+**Xalibre** is a comprehensive e-book management tool designed to organize your EPUB library, fetch metadata, edit book details, and convert files into the optimized **XTC** format for e-ink devices (specifically the Xteink X4).
 
-> **Note:** This application was formerly known as **Epub2XTC** before evolving into the full-featured Xlibre Library Manager.
+> **Note:** This application was formerly known as **Epub2XTC** before evolving into the full-featured Xalibre Library Manager.
 
 ---
 
@@ -23,11 +23,11 @@
 ## 🚀 Getting Started
 
 ### Installation
-* **Run**: Execute the `Xlibre-main.py` script or launch the compiled executable.
+* **Run**: Execute the `Xalibre-main.py` script or launch the compiled executable.
 * **First Run**: The application automatically creates necessary directories:
-    * **Windows Config**: `%APPDATA%\Xlibre`
-    * **Mac/Linux Config**: `~/.config/xlibre`
-    * **Library Data**: Creates `Library`, `Exports`, `Presets`, and `Fonts` folders in your base directory (default `~/Xlibre`).
+    * **Windows Config**: `%APPDATA%\Xalibre`
+    * **Mac/Linux Config**: `~/.config/Xalibre`
+    * **Library Data**: Creates `Library`, `Exports`, `Presets`, and `Fonts` folders in your base directory (default `~/Xalibre`).
 
 ---
 
@@ -48,7 +48,7 @@ Accessed by clicking a book's cover or right-clicking to open **Book Details**:
 * *Note: There is no raw hex viewer.*
 
 ### 3. Device Manager (Sending Books)
-Xlibre includes a dedicated manager for the Xteink X4:
+Xalibre includes a dedicated manager for the Xteink X4:
 * **Manual Manager**: Click **`📟 Device Mgr`** to connect to the device IP. You can browse folders and **drag & drop** files into the list to upload.
 * **Quick Send**: Select books in the library and click **`📲 Send`**.
     * **Wi-Fi**: Supports Custom IP, X4 Hotspot (`192.168.3.3`), and CrossPoint profiles.
@@ -99,7 +99,7 @@ Select a book and click **`⚡ Convert`** to open the Editor. This prepares the 
 
 ## ⚙️ Settings
 
-**Access**: Click the large **"XLIBRE MANAGER"** logo text in the top-left of the toolbar.
+**Access**: Click the large **"Xalibre MANAGER"** logo text in the top-left of the toolbar.
 
 * **Library Location**: Change the physical path of your library folder.
 * **Device IP**: Set the default IP address for the X4 Reader.
