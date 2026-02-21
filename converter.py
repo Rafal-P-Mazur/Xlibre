@@ -21,7 +21,18 @@ import hashlib
 import csv  # Added for AoA parsing
 import tempfile
 
+import tempfile
+import uuid
+
 # --- OPTIONAL DEPENDENCIES ---
+
+try:
+    from fontTools.ttLib import TTFont
+
+    HAS_FONTTOOLS = True
+except ImportError:
+    HAS_FONTTOOLS = False
+
 try:
     import wordfreq
 
@@ -47,15 +58,17 @@ FACTORY_DEFAULTS = {
     "font_size": 28,
     "font_weight": 400,
     "line_height": 1.4,
+    "word_spacing": 0.0,
     "margin": 20,
     "top_padding": 15,
     "bottom_padding": 32,
     "orientation": "Portrait",
     "text_align": "justify",
-    "font_name": "Default (System)",
+    "font_name": "",
     "preview_zoom": 440,
     "generate_toc": True,
     "show_footnotes": False,
+    "hyphenate_text": True,
 
     # --- SPECTRA AI ANNOTATIONS ---
     "spectra_enabled": False,
@@ -77,6 +90,7 @@ FACTORY_DEFAULTS = {
     "order_title": 2,
     "order_chap_page": 3,
     "order_percent": 4,
+    "order_progress": 5,
 
     # --- PROGRESS BAR POSITION ---
     "pos_progress": "Footer (Below Text)",
@@ -96,6 +110,9 @@ FACTORY_DEFAULTS = {
     "footer_font_size": 16,
     "footer_align": "Center",
     "footer_margin": 10,
+    "ui_font_source": "Body Font",
+    "ui_separator": "   |   ",
+    "ui_side_margin": 15,
 
     # --- RENDER MODES ---
     "bit_depth": "1-bit (XTG)",
@@ -106,11 +123,10 @@ FACTORY_DEFAULTS = {
     "text_blur": 1.0,
 }
 
-
 if getattr(sys, 'frozen', False):
     # Running as compiled PyInstaller executable
-    EXTERNAL_DIR = os.path.dirname(sys.executable) # Outside the .exe (User can see/edit)
-    INTERNAL_DIR = sys._MEIPASS                    # Inside the .exe (Hidden, read-only)
+    EXTERNAL_DIR = os.path.dirname(sys.executable)  # Outside the .exe (User can see/edit)
+    INTERNAL_DIR = sys._MEIPASS  # Inside the .exe (Hidden, read-only)
 else:
     # Running as a standard Python script
     EXTERNAL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -125,6 +141,7 @@ AOA_FILE = os.path.join(INTERNAL_DIR, "AoA_51715_words.csv")
 
 # Global AoA Database
 AOA_DB = {}
+
 
 def load_aoa_database():
     """Loads the Kuperman AoA CSV into a global dict."""
@@ -161,7 +178,7 @@ def load_aoa_database():
                 except ValueError:
                     continue
 
-            #print(f"Loaded {count} words from AoA database.")
+            # print(f"Loaded {count} words from AoA database.")
     except Exception as e:
         print(f"Error loading AoA CSV: {e}")
 
@@ -253,7 +270,7 @@ class SpectraAnnotator:
         # ... (Language Code Logic omitted for brevity, it was fine) ...
         # Assume is_translation logic is here
         is_translation = (
-                    target_code != 'en' and self.language.startswith('en') == False)  # Simplified check for snippet
+                target_code != 'en' and self.language.startswith('en') == False)  # Simplified check for snippet
 
         if self.target_lang != "English" and not self.language.lower().startswith(target_code):
             is_translation = True
@@ -499,7 +516,6 @@ class SpectraAnnotator:
                         if force or unique_key not in self.master_cache:
                             batch_items[unique_key] = sentence
 
-
         if batch_items:
             items = list(batch_items.items())
             is_local = "localhost" in self.base_url or "127.0.0.1" in self.base_url
@@ -554,6 +570,7 @@ def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
 
     return css_text
 
+
 def get_font_variants(font_path):
     if not font_path or not os.path.exists(font_path):
         return {}
@@ -562,34 +579,159 @@ def get_font_variants(font_path):
         all_files = [f for f in os.listdir(directory) if f.lower().endswith((".ttf", ".otf"))]
     except:
         return {}
+    
     candidates = {"regular": [], "italic": [], "bold": [], "bold_italic": []}
+    variable_fonts = []
 
     for f in all_files:
         full_path = os.path.join(directory, f).replace("\\", "/")
         name_lower = f.lower()
-        has_bold = any(x in name_lower for x in ["bold", "bd"])
+        
+        # Detect Variable Fonts
+        if any(x in name_lower for x in ["variable", "var", "[wght]", "-vf"]):
+            variable_fonts.append(full_path)
+
+        # Expanded detection logic (Medium/Semi treated as Bold candidates with lower priority)
+        has_bold = any(x in name_lower for x in ["bold", "bd", "demi", "heavy", "black", "blk", "ultra", "semi", "medium", "med"])
         has_italic = any(x in name_lower for x in ["italic", "oblique", "obl"])
+        
         if has_bold and has_italic:
             candidates["bold_italic"].append(full_path)
-            continue
-        if has_bold and not has_italic:
+        elif has_bold:
             candidates["bold"].append(full_path)
-            continue
-        if has_italic and not has_bold:
+        elif has_italic:
             candidates["italic"].append(full_path)
-            continue
-        candidates["regular"].append(full_path)
+        else:
+            candidates["regular"].append(full_path)
 
     def pick_best(file_list):
         if not file_list: return None
-        return sorted(file_list, key=lambda p: len(os.path.basename(p)))[0]
+        
+        def score(path):
+            base = os.path.basename(path).lower()
+            s = len(base)
+            # Penalize non-standard weights to prefer pure "Bold" or "Italic"
+            if "semi" in base or "demi" in base: s += 10
+            if "medium" in base or "med" in base: s += 20
+            if "black" in base or "heavy" in base or "ultra" in base: s += 5
+            return s
+            
+        return sorted(file_list, key=score)[0]
 
-    return {
+    res = {
         "regular": font_path.replace("\\", "/"),
         "italic": pick_best(candidates["italic"]),
         "bold": pick_best(candidates["bold"]),
         "bold_italic": pick_best(candidates["bold_italic"])
     }
+
+    # Fallback to Variable Font if specific variant is missing
+    if variable_fonts:
+        vf = variable_fonts[0]
+        # Prefer the one passed as font_path if it is variable
+        if font_path.replace("\\", "/") in variable_fonts:
+            vf = font_path.replace("\\", "/")
+            
+        if not res["bold"]: res["bold"] = vf
+        if not res["italic"]: res["italic"] = vf
+        if not res["bold_italic"]: res["bold_italic"] = vf
+
+    return res
+
+
+def create_tracking_font(original_path, tracking_em):
+    """
+    Hacks the font to add 'tracking_em' width to EVERY character.
+    Used to simulate letter-spacing without destroying text content.
+    """
+    if not HAS_FONTTOOLS or not original_path or not os.path.exists(original_path):
+        return original_path
+
+    try:
+        temp_dir = tempfile.gettempdir()
+        ext = os.path.splitext(original_path)[1]
+        temp_name = f"tracking_font_{uuid.uuid4()}{ext}"
+        temp_path = os.path.join(temp_dir, temp_name)
+
+        font = TTFont(original_path)
+        upm = font['head'].unitsPerEm
+        extra_units = int(upm * tracking_em)
+
+        # Iterate over the horizontal metrics table (hmtx)
+        if 'hmtx' in font:
+            hmtx = font['hmtx']
+            metrics = hmtx.metrics
+            for glyph_name in metrics:
+                width, lsb = metrics[glyph_name]
+                # Add the tracking space to every single character
+                metrics[glyph_name] = (width + extra_units, lsb)
+
+        font.save(temp_path)
+        return temp_path
+
+    except Exception as e:
+        print(f"Tracking Font Hack Failed: {e}")
+        return original_path
+
+
+def create_spaced_font(original_path, spacing_em):
+    """
+    Hacks the TTF/OTF binary to physically widen the space character.
+    Returns path to a temporary font file.
+    """
+    if not HAS_FONTTOOLS or not original_path or not os.path.exists(original_path):
+        return original_path
+
+    try:
+        # Generate a unique temp path
+        temp_dir = tempfile.gettempdir()
+        ext = os.path.splitext(original_path)[1]
+        temp_name = f"spaced_font_{uuid.uuid4()}{ext}"
+        temp_path = os.path.join(temp_dir, temp_name)
+
+        # Load the font
+        font = TTFont(original_path)
+
+        # Calculate extra units
+        # Standard TrueType is usually 1000 or 2048 units per em
+        upm = font['head'].unitsPerEm
+        extra_units = int(upm * spacing_em)
+
+        # 1. Identify the Space Glyph
+        # Map char code 32 (space) to glyph name
+        cmap = font.getBestCmap()
+        space_name = cmap.get(32)
+
+        if space_name:
+            # 2. Modify Horizontal Metrics (hmtx)
+            # hmtx table entries are (advanceWidth, leftSideBearing)
+            if 'hmtx' in font:
+                hmtx = font['hmtx']
+                current_width, lsb = hmtx[space_name]
+
+                # Apply the stretch
+                new_width = current_width + extra_units
+                hmtx[space_name] = (new_width, lsb)
+
+            # 3. Handle CFF fonts (OTF) if they exist
+            # CFF uses its own width definition, usually separate from hmtx
+            if 'CFF ' in font:
+                cff = font['CFF '].cff
+                top_dict = cff.topDictIndex[0]
+                char_strings = top_dict.CharStrings
+                if space_name in char_strings:
+                    # CFF width modification is complex; usually hmtx sync is enough
+                    # for most renderers, but strict CFF readers might ignore hmtx.
+                    # For PyMuPDF/MuPDF, hmtx modification usually suffices.
+                    pass
+
+        # Save the hacked font
+        font.save(temp_path)
+        return temp_path
+
+    except Exception as e:
+        print(f"Font Hack Failed: {e}")
+        return original_path
 
 
 def get_pil_font(font_path, size):
@@ -699,7 +841,7 @@ def hyphenate_html_text(soup, language_code):
 
         def replace_match(match):
             word = match.group(0)
-            if len(word) < 6: return word
+            if len(word) < 4: return word
             return dic.inserted(word, hyphen='\u00AD')
 
         new_text = word_pattern.sub(replace_match, clean_text)
@@ -730,6 +872,24 @@ def get_local_fonts():
 
             # Store the absolute path for the renderer
             font_map[item] = os.path.abspath(os.path.join(item_path, main_file))
+
+    # 2. Scan Xlibre/Fonts (Root files)
+    for item in os.listdir(fonts_dir):
+        item_path = os.path.join(fonts_dir, item)
+        if os.path.isfile(item_path) and item.lower().endswith((".ttf", ".otf")):
+            name = os.path.splitext(item)[0]
+            if name not in font_map:
+                font_map[name] = os.path.abspath(item_path)
+
+    # 3. System Fallback (Ensure at least one font exists for hacks)
+    if not font_map:
+        if sys.platform.startswith("win"):
+            sys_font_dir = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+            targets = ["times.ttf", "arial.ttf", "georgia.ttf", "seguiemj.ttf"]
+            for t in targets:
+                p = os.path.join(sys_font_dir, t)
+                if os.path.exists(p):
+                    font_map["System " + t.split('.')[0].capitalize()] = p
 
     return font_map
 
@@ -1166,7 +1326,7 @@ class EpubProcessor:
     def render_chapters(self, selected_indices, font_path, font_size, margin, line_height, font_weight, bottom_padding,
                         top_padding, text_align="justify", orientation="Portrait", add_toc=True, show_footnotes=True,
                         layout_settings=None, progress_callback=None):
-        self.font_path = font_path if font_path != "DEFAULT" else ""
+        self.font_path = font_path
         self.font_size = font_size
         self.margin = margin
         self.font_weight = font_weight
@@ -1174,6 +1334,8 @@ class EpubProcessor:
         self.top_padding = top_padding
         self.text_align = text_align
         self.layout_settings = layout_settings if layout_settings else {}
+
+        word_spacing = self.layout_settings.get("word_spacing", 0.0)
 
         # 1. Force comfortable line height if Spectra is enabled
         spectra_enabled = self.layout_settings.get("spectra_enabled", False)
@@ -1183,7 +1345,7 @@ class EpubProcessor:
             self.line_height = line_height
 
         # 2. Orientation logic
-        if orientation == "Landscape":
+        if "Landscape" in orientation:
             self.screen_width = DEFAULT_SCREEN_HEIGHT
             self.screen_height = DEFAULT_SCREEN_WIDTH
         else:
@@ -1200,28 +1362,105 @@ class EpubProcessor:
         self.init_annotator(self.layout_settings)
 
         # 4. CSS Font Generation
-        if self.font_path:
-            variants = get_font_variants(self.font_path)
-            font_rules = []
-            font_rules.append(
-                f"""@font-face {{ font-family: "CustomFont"; src: url("{variants['regular']}"); font-weight: normal; font-style: normal; }}""")
-            if variants['italic']: font_rules.append(
-                f"""@font-face {{ font-family: "CustomFont"; src: url("{variants['italic']}"); font-weight: normal; font-style: italic; }}""")
-            if variants['bold']: font_rules.append(
-                f"""@font-face {{ font-family: "CustomFont"; src: url("{variants['bold']}"); font-weight: bold; font-style: normal; }}""")
-            if variants['bold_italic']: font_rules.append(
-                f"""@font-face {{ font-family: "CustomFont"; src: url("{variants['bold_italic']}"); font-weight: bold; font-style: italic; }}""")
-            font_face_rule = "\n".join(font_rules)
-            font_family_val = '"CustomFont"'
-        else:
-            font_face_rule = ""
-            font_family_val = "serif"
+        # --- FONT GENERATION START ---
 
-        patched_css = fix_css_font_paths(self.book_css, font_family_val)
+        font_rules = []  # <--- THIS LINE WAS MISSING
+
+        # A. Prepare BODY font (Word Spacing Slider)
+        body_font_path = self.font_path
+        word_spacing = self.layout_settings.get("word_spacing", 0.0)
+        css_word_spacing = word_spacing
+
+        if word_spacing > 0.05 and self.font_path and HAS_FONTTOOLS:
+            # We hack the font character physically
+            body_font_path = create_spaced_font(self.font_path, word_spacing)
+            # Since the font is hacked, we tell CSS to use 0 to avoid double-spacing
+            css_word_spacing = 0
+
+        # B. Prepare HEADER font
+        header_font_path = self.font_path
+
+        # C. Prepare SPACED font (ROBUST FIX)
+        base_spaced_path = self.font_path
+        clean_base_spaced = ""
+
+        # 1. ALWAYS create a base spaced version if possible
+        if self.font_path and HAS_FONTTOOLS and os.path.exists(self.font_path):
+            try:
+                base_spaced_path = create_tracking_font(self.font_path, 0.15)
+                clean_base_spaced = base_spaced_path.replace("\\", "/")
+            except Exception as e:
+                print(f"Failed to create base tracking font: {e}")
+
+        # 2. Register the REGULAR rule immediately
+        if clean_base_spaced:
+            font_rules.append(
+                f'@font-face {{ font-family: "CustomFontSpaced"; src: url("{clean_base_spaced}"); font-weight: normal; font-style: normal; }}')
+
+        # 3. Handle Variants (Italic/Bold)
+        if HAS_FONTTOOLS and self.font_path:
+            vars = get_font_variants(self.font_path)
+
+            # --- ITALIC LOGIC ---
+            ital_path = clean_base_spaced
+            if vars.get('italic'):
+                try:
+                    ital_path = create_tracking_font(vars['italic'], 0.15).replace("\\", "/")
+                except:
+                    pass
+
+            if ital_path:
+                font_rules.append(
+                    f'@font-face {{ font-family: "CustomFontSpaced"; src: url("{ital_path}"); font-weight: normal; font-style: italic; }}')
+
+            # --- BOLD LOGIC ---
+            bold_path = clean_base_spaced
+            if vars.get('bold'):
+                try:
+                    bold_path = create_tracking_font(vars['bold'], 0.15).replace("\\", "/")
+                except:
+                    pass
+
+            if bold_path:
+                font_rules.append(
+                    f'@font-face {{ font-family: "CustomFontSpaced"; src: url("{bold_path}"); font-weight: bold; font-style: normal; }}')
+
+        # D. Finalize Font Variables
+        def add_font_face(name, path):
+            if not path: return
+            # Helper to generate standard font rules
+            v = get_font_variants(path)
+            if not v:
+                return
+            font_rules.append(
+                f'@font-face {{ font-family: "{name}"; src: url("{v["regular"]}"); font-weight: normal; font-style: normal; }}')
+            if v['bold']:
+                font_rules.append(
+                    f'@font-face {{ font-family: "{name}"; src: url("{v["bold"]}"); font-weight: bold; font-style: normal; }}')
+            if v['italic']:
+                font_rules.append(
+                    f'@font-face {{ font-family: "{name}"; src: url("{v["italic"]}"); font-weight: normal; font-style: italic; }}')
+            if v['bold_italic']:
+                font_rules.append(
+                    f'@font-face {{ font-family: "{name}"; src: url("{v["bold_italic"]}"); font-weight: bold; font-style: italic; }}')
+
+        if self.font_path:
+            add_font_face("CustomFontBody", body_font_path)
+            add_font_face("CustomFontHeader", header_font_path)
+
+            font_val_body = '"CustomFontBody"'
+            font_val_header = '"CustomFontHeader"'
+        else:
+            font_val_body = "serif"
+            font_val_header = "serif"
+
+        font_face_rule = "\n".join(font_rules)
+
+        # --- FONT GENERATION END ---
+
+        patched_css = fix_css_font_paths(self.book_css, font_val_body)
         content_height = max(1, self.screen_height - self.top_padding - self.bottom_padding)
 
-        # --- 5. GLOBAL CSS (The Hybrid Approach) ---
-        # --- 5. GLOBAL CSS (Optimized for EM Scaling) ---
         # --- 5. GLOBAL CSS (Optimized for EM Scaling & Calibre Override) ---
         custom_css = f"""
                     <style>
@@ -1237,54 +1476,60 @@ class EpubProcessor:
                         }}
 
                         /* 2. BODY CONTAINER CONTROLS */
+                        /* 2. BODY CONTAINER CONTROLS */
                         body {{
-                            font-family: {font_family_val} !important;
+                            font-family: {font_val_body} !important; 
                             font-size: {self.font_size}pt !important;
                             font-weight: {self.font_weight} !important;
                             line-height: {self.line_height} !important;
                             text-align: {self.text_align} !important;
                             color: black !important;
                             background-color: white !important;
-                            /* This padding applies the SLIDER margin to the whole page */
                             padding: {self.margin}px !important; 
                             box-sizing: border-box !important;
                         }}
 
                         /* 3. OVERRIDE CALIBRE/GENERIC TAGS */
-                        /* We target broad tags to kill specific margins/padding defined by the book */
-                        p, div, li, dd, dt, span {{
+                        p, div, li, dd, dt, span, blockquote {{
                             font-family: inherit !important;
                             line-height: inherit !important;
+
+                            /* FORCE WORD SPACING HERE */
+                            word-spacing: {css_word_spacing}em !important; 
+
+
+                            hyphens: manual !important;
+                            adobe-hyphenate: explicit !important;
+
                             color: inherit !important;
-                            
-                            /* REMOVED margin-left/right: 0 here so we can override it for blockquotes below */
+
+                            color: inherit !important;
                             padding-left: 0;
                             padding-right: 0;
                             margin-top: 0.5em;
                             margin-bottom: 0.5em;
                             text-indent: 1.5em;
                             max-width: 100% !important;
-                            
                         }}
-                        
+
                         /* ADD THIS NEW BLOCK */
                         blockquote {{
                             margin-left: 1.5em !important;  /* Give visual indication of quote */
                             margin-right: 1.5em !important;
                             font-style: italic;             /* Optional: helps distinguish quotes */
                         }}
-                        
+
                         /* Ensure centered text doesn't have an indent (Helper class if needed) */
                         .center-text {{
                             text-align: center !important;
                             text-indent: 0 !important;
                         }}
-                                                
+
                         /* Conservative scale: Subtle enough to save space, distinct enough to read */
                         h1 {{ font-size: 1.35em !important; margin-top: 0.8em; margin-bottom: 0.4em; }}
                         h2 {{ font-size: 1.25em !important; margin-top: 0.7em; margin-bottom: 0.3em; }}
                         h3 {{ font-size: 1.15em !important; margin-top: 0.6em; margin-bottom: 0.2em; }}
-                        
+
                         /* H4-H6 are now the same size as body text, but distinguished by style */
                         h4, h5, h6 {{ 
                             font-size: 1.0em !important; 
@@ -1293,8 +1538,9 @@ class EpubProcessor:
                             letter-spacing: 0.05em; 
                             margin-top: 0.5em;
                         }}
-                        
+
                         h1, h2, h3, h4, h5, h6 {{ 
+                            font-family: {font_val_header} !important;
                             text-indent: 0 !important;
                             font-weight: bold !important;
                             line-height: 1.1 !important; /* Tighter line height for headers looks cleaner */
@@ -1327,6 +1573,12 @@ class EpubProcessor:
                             text-indent: 0 !important;
                         }}
                         .inline-footnote-box strong {{ margin-right: 4px !important; }}
+
+                        .custom-spaced, .custom-spaced * {{
+                            font-family: 'CustomFontSpaced' !important;
+                            hyphens: manual !important;
+                            word-break: normal !important;
+                        }}
                     </style>
                 """
 
@@ -1371,7 +1623,8 @@ class EpubProcessor:
             if show_footnotes:
                 soup = self._inject_inline_footnotes(soup, chapter.get('filename', ''))
 
-            soup = hyphenate_html_text(soup, self.book_lang)
+            if self.layout_settings.get("hyphenate_text", True):
+                soup = hyphenate_html_text(soup, self.book_lang)
 
             # --- SVG WRAPPER FIX ---
             for svg in soup.find_all('svg'):
@@ -1547,38 +1800,66 @@ class EpubProcessor:
         return True
 
     def _get_ui_font(self, size):
-        if self.font_path: return get_pil_font(self.font_path, size)
+        mode = self.layout_settings.get("ui_font_source", "Body Font")
+        if mode == "Body Font" and self.font_path:
+            return get_pil_font(self.font_path, size)
+        if mode == "Sans-Serif":
+            for f in ["arial.ttf", "segoeui.ttf", "helvetica.ttf", "calibri.ttf", "roboto.ttf", "DejaVuSans.ttf"]:
+                try:
+                    return ImageFont.truetype(f, size)
+                except:
+                    pass
         try:
             return ImageFont.truetype("georgia.ttf", size)
         except:
-            return ImageFont.load_default()
+            try:
+                return ImageFont.truetype("times.ttf", size)
+            except:
+                return ImageFont.load_default()
 
     def _render_toc_pages(self, toc_entries, row_height, font_size, header_size):
         pages = []
 
-        def get_dynamic_toc_font(size):
-            if self.font_path: return get_pil_font(self.font_path, size)
-            try:
-                return ImageFont.truetype("georgia.ttf", size)
-            except:
-                return ImageFont.load_default()
+        font_main = self._get_ui_font(font_size)
 
-        font_main = get_dynamic_toc_font(font_size)
-        font_header = get_dynamic_toc_font(header_size)
-        left_margin = 40;
-        right_margin = 40;
-        column_gap = 20;
+        # --- NEW: Auto-scale Header ---
+        header_text = "TABLE OF CONTENTS"
+        safe_width = self.screen_width - 30
+
+        # Start large and shrink until it fits
+        current_header_size = header_size
+        font_header = self._get_ui_font(current_header_size)
+
+        while current_header_size > 12:
+            if font_header.getlength(header_text) <= safe_width:
+                break
+            current_header_size -= 2
+            font_header = self._get_ui_font(current_header_size)
+        # -----------------------------
+
+        left_margin = 40
+        right_margin = 40
+        column_gap = 20
         limit = self.toc_items_per_page
+
         for i in range(0, len(toc_entries), limit):
             chunk = toc_entries[i: i + limit]
             img = Image.new('1', (self.screen_width, self.screen_height), 1)
             draw = ImageDraw.Draw(img)
-            header_text = "TABLE OF CONTENTS"
+
+            # Draw Header using the new SAFE font size
             header_w = font_header.getlength(header_text)
             header_y = 40 + self.top_padding
+
+            # 1. Draw Text (Only once!)
             draw.text(((self.screen_width - header_w) // 2, header_y), header_text, font=font_header, fill=0)
-            line_y = header_y + int(header_size * 1.5)
+
+            # 2. Calculate Line Position (Using the NEW current_header_size)
+            line_y = header_y + int(current_header_size * 1.5)
+
+            # 3. Draw Divider Line
             draw.line((left_margin, line_y, self.screen_width - right_margin, line_y), fill=0)
+
             y = line_y + int(font_size * 1.2)
             for title, pg_num in chunk:
                 pg_str = str(pg_num)
@@ -1600,7 +1881,7 @@ class EpubProcessor:
             pages.append(img)
         return pages
 
-    def _draw_progress_bar(self, draw, y, height, global_page_index):
+    def _draw_progress_bar(self, draw, y, height, global_page_index, override_x=None, override_width=None):
         if self.total_pages <= 0: return
         show_ticks = self.layout_settings.get("bar_show_ticks", True)
         tick_h = self.layout_settings.get("bar_tick_height", 6)
@@ -1608,21 +1889,29 @@ class EpubProcessor:
         marker_r = self.layout_settings.get("bar_marker_radius", 5)
         marker_col_str = self.layout_settings.get("bar_marker_color", "Black")
         marker_fill = (255, 255, 255) if marker_col_str == "White" else (0, 0, 0)
-        draw.rectangle([10, y, self.screen_width - 10, y + height], fill=(255, 255, 255), outline=(0, 0, 0))
+        if override_x is not None and override_width is not None:
+            x_start = override_x
+            bar_width_px = override_width
+        else:
+            x_start = 10
+            bar_width_px = self.screen_width - 20
+
+        draw.rectangle([x_start, y, x_start + bar_width_px, y + height], fill=(255, 255, 255), outline=(0, 0, 0))
+
         if show_ticks:
             bar_center_y = y + (height / 2)
             t_top = bar_center_y - (tick_h / 2)
             t_bot = bar_center_y + (tick_h / 2)
             chapter_pages = [item[1] for item in self.toc_data_final]
             for cp in chapter_pages:
-                mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
+                mx = int(((cp - 1) / self.total_pages) * bar_width_px) + x_start
                 draw.line([mx, t_top, mx, t_bot], fill=(0, 0, 0), width=1)
         curr_page_disp = global_page_index + 1
-        bar_width_px = self.screen_width - 20
         fill_width = int((curr_page_disp / self.total_pages) * bar_width_px)
-        draw.rectangle([10, y, 10 + fill_width, y + height], fill=(0, 0, 0))
+        draw.rectangle([x_start, y, x_start + fill_width, y + height], fill=(0, 0, 0))
+
         if show_marker:
-            cx = 10 + fill_width
+            cx = x_start + fill_width
             cy = y + (height / 2)
             draw.ellipse([cx - marker_r, cy - marker_r, cx + marker_r, cy + marker_r], fill=marker_fill,
                          outline=(0, 0, 0))
@@ -1651,89 +1940,208 @@ class EpubProcessor:
         return {'pagenum': f"{page_num_disp}/{self.total_pages}", 'title': current_title, 'chap_page': chap_page_disp,
                 'percent': f"{percent}%"}
 
-    def _draw_text_line(self, draw, y, font, elements_list, align):
+    def _draw_text_line(self, draw, y, font, elements_list, align, global_page_index=0):
         if not elements_list: return
-        separator = "   |   "
-        margin_x = 15
-        if align == "Justify" and len(elements_list) > 1:
-            left_item = elements_list[0]
-            left_text = left_item[1]
-            draw.text((margin_x, y), left_text, font=font, fill=(0, 0, 0))
-            right_item = elements_list[-1]
-            right_text = right_item[1]
-            right_w = font.getlength(right_text)
-            draw.text((self.screen_width - margin_x - right_w, y), right_text, font=font, fill=(0, 0, 0))
-            if len(elements_list) > 2:
-                mid_items = elements_list[1:-1]
-                mid_text_parts = []
-                title_in_middle = False
-                title_original = ""
-                for key, txt in mid_items:
-                    if key == 'title':
-                        title_in_middle = True
-                        title_original = txt
-                    mid_text_parts.append(txt)
-                left_boundary = margin_x + font.getlength(left_text) + 20
-                right_boundary = self.screen_width - margin_x - right_w - 20
-                max_mid_w = right_boundary - left_boundary
-                if max_mid_w < 50: return
-                final_mid_text = separator.join(mid_text_parts)
-                if title_in_middle and font.getlength(final_mid_text) > max_mid_w:
-                    non_title_w = sum([font.getlength(p) for k, p in mid_items if k != 'title'])
-                    sep_w_total = font.getlength(separator) * (len(mid_items) - 1) if len(mid_items) > 1 else 0
-                    available_for_title = max_mid_w - non_title_w - sep_w_total
-                    if available_for_title > 20:
-                        trunc_title = title_original
-                        while font.getlength(trunc_title + "...") > available_for_title and len(
-                                trunc_title) > 0: trunc_title = trunc_title[:-1]
-                        trunc_title += "..."
-                        new_parts = []
-                        for key, txt in mid_items:
-                            if key == 'title':
-                                new_parts.append(trunc_title)
-                            else:
-                                new_parts.append(txt)
-                        final_mid_text = separator.join(new_parts)
-                    else:
-                        final_mid_text = separator.join([p for k, p in mid_items if k != 'title'])
-                mid_w = font.getlength(final_mid_text)
-                mid_x = (self.screen_width - mid_w) // 2
-                if mid_x < left_boundary: mid_x = left_boundary
-                draw.text((mid_x, y), final_mid_text, font=font, fill=(0, 0, 0))
-        else:
-            other_text = ""
-            title_text = ""
-            has_title = False
-            non_title_parts = []
-            for key, txt in elements_list:
-                if key == 'title':
-                    title_text = txt
-                    has_title = True
-                else:
-                    non_title_parts.append(txt)
-            sep_w = font.getlength(separator) * (len(elements_list) - 1) if len(elements_list) > 1 else 0
-            others_w = sum([font.getlength(p) for p in non_title_parts])
-            max_screen = self.screen_width - 30
-            available_for_title = max_screen - others_w - sep_w
-            if has_title:
-                if font.getlength(title_text) > available_for_title:
-                    while font.getlength(title_text + "...") > available_for_title and len(
-                            title_text) > 0: title_text = title_text[:-1]
-                    title_text += "..."
-            final_parts = []
-            for key, txt in elements_list:
-                if key == 'title':
-                    final_parts.append(title_text)
-                else:
-                    final_parts.append(txt)
-            full_str = separator.join(final_parts)
-            str_w = font.getlength(full_str)
-            x_pos = 15
-            if align == "Center":
-                x_pos = (self.screen_width - str_w) // 2
+        separator = self.layout_settings.get("ui_separator", "   |   ")
+        margin_x = int(self.layout_settings.get("ui_side_margin", 15))
+        bar_height = int(self.layout_settings.get("bar_height", 4))
+
+        # --- STABILITY FIX: Calculate Reserved Widths ---
+        processed_elements = []
+        for k, v in elements_list:
+            if k == 'progress':
+                processed_elements.append({'key': k, 'text': v, 'width': 0, 'reserved': 0})
+                continue
+
+            real_w = font.getlength(v)
+            reserved_w = real_w
+
+            if k == 'pagenum':
+                digits = len(str(self.total_pages))
+                max_s = f"{'8' * digits}/{'8' * digits}"
+                reserved_w = max(real_w, font.getlength(max_s))
+            elif k == 'percent':
+                reserved_w = max(real_w, font.getlength("100%"))
+            elif k == 'chap_page':
+                if '/' in v:
+                    try:
+                        _, total = v.split('/')
+                        digits = len(total)
+                        max_s = f"{'8' * digits}/{'8' * digits}"
+                        reserved_w = max(real_w, font.getlength(max_s))
+                    except:
+                        pass
+
+            processed_elements.append({'key': k, 'text': v, 'width': real_w, 'reserved': reserved_w})
+
+        # Helper to truncate
+        def truncate_to_fit(text, max_w):
+            if max_w <= 0: return ""
+            if font.getlength(text) <= max_w: return text
+            ellipsis = "..."
+            temp = text
+            while font.getlength(temp + ellipsis) > max_w and len(temp) > 0:
+                temp = temp[:-1]
+            return temp + ellipsis
+
+        has_prog = any(x['key'] == 'progress' for x in processed_elements)
+
+        if has_prog:
+            non_title_w = sum(x['reserved'] for x in processed_elements if x['key'] not in ['progress', 'title'])
+            sep_width = font.getlength(separator)
+            total_sep_width = sep_width * (len(processed_elements) - 1)
+
+            if align == "Justify":
+                min_bar_w = int(self.screen_width * 0.25)
+                avail_for_title = self.screen_width - (2 * margin_x) - non_title_w - total_sep_width - min_bar_w
+            else:
+                bar_width = int(self.screen_width * 0.3)
+                avail_for_title = self.screen_width - (2 * margin_x) - non_title_w - total_sep_width - bar_width
+
+            for item in processed_elements:
+                if item['key'] == 'title':
+                    item['text'] = truncate_to_fit(item['text'], avail_for_title)
+                    item['width'] = font.getlength(item['text'])
+                    item['reserved'] = item['width']
+
+            current_text_w = sum(x['reserved'] for x in processed_elements if x['key'] != 'progress')
+
+            if align == "Justify":
+                bar_width = self.screen_width - (2 * margin_x) - current_text_w - total_sep_width
+                if bar_width < 10: bar_width = 10
+            else:
+                bar_width = int(self.screen_width * 0.3)
+                # Safety: Ensure fixed bar doesn't push content off-screen
+                avail = self.screen_width - (2 * margin_x) - current_text_w - total_sep_width
+                if bar_width > avail: bar_width = max(10, avail)
+
+            total_content_width = current_text_w + bar_width + total_sep_width
+
+            if align == "Justify":
+                start_x = margin_x
+            elif align == "Center":
+                start_x = (self.screen_width - total_content_width) // 2
             elif align == "Right":
-                x_pos = self.screen_width - 15 - str_w
-            draw.text((x_pos, y), full_str, font=font, fill=(0, 0, 0))
+                start_x = self.screen_width - margin_x - total_content_width
+            else:
+                start_x = margin_x
+
+            if start_x < margin_x: start_x = margin_x
+
+            ascent, descent = font.getmetrics()
+            text_height = ascent + descent
+            bar_y = y + (text_height / 2) - (bar_height / 2)
+
+            current_x = start_x
+            for i, item in enumerate(processed_elements):
+                if item['key'] == 'progress':
+                    self._draw_progress_bar(draw, bar_y, bar_height, global_page_index, override_x=current_x, override_width=bar_width)
+                    current_x += bar_width
+                else:
+                    draw_x = current_x + (item['reserved'] - item['width']) // 2
+                    draw.text((draw_x, y), item['text'], font=font, fill=(0, 0, 0))
+                    current_x += item['reserved']
+
+                if i < len(processed_elements) - 1:
+                    if separator.strip():
+                        draw.text((current_x, y), separator, font=font, fill=(0, 0, 0))
+                    current_x += sep_width
+            return
+
+        # --- STANDARD LAYOUT ---
+        non_title_w = sum(x['reserved'] for x in processed_elements if x['key'] != 'title')
+        sep_w = font.getlength(separator)
+        total_sep_w = sep_w * (len(processed_elements) - 1) if len(processed_elements) > 1 else 0
+        content_max_w = self.screen_width - (2 * margin_x)
+
+        if align == "Justify" and len(processed_elements) > 1:
+            left_item = processed_elements[0]
+            right_item = processed_elements[-1]
+            mid_items = processed_elements[1:-1] if len(processed_elements) > 2 else []
+
+            gap = 20
+            title_loc = "none"
+            if left_item['key'] == 'title': title_loc = "left"
+            elif right_item['key'] == 'title': title_loc = "right"
+            elif any(x['key'] == 'title' for x in mid_items): title_loc = "mid"
+
+            w_left = left_item['reserved'] if left_item['key'] != 'title' else 0
+            w_right = right_item['reserved'] if right_item['key'] != 'title' else 0
+            w_mid_static = sum(x['reserved'] for x in mid_items if x['key'] != 'title')
+            w_mid_sep = sep_w * (len(mid_items) - 1) if len(mid_items) > 1 else 0
+
+            if title_loc == "left":
+                avail = content_max_w - w_right - gap
+                if mid_items: avail -= (w_mid_static + w_mid_sep + gap)
+                left_item['text'] = truncate_to_fit(left_item['text'], avail)
+                left_item['width'] = font.getlength(left_item['text'])
+                left_item['reserved'] = left_item['width']
+            elif title_loc == "right":
+                avail = content_max_w - w_left - gap
+                if mid_items: avail -= (w_mid_static + w_mid_sep + gap)
+                right_item['text'] = truncate_to_fit(right_item['text'], avail)
+                right_item['width'] = font.getlength(right_item['text'])
+                right_item['reserved'] = right_item['width']
+            elif title_loc == "mid":
+                avail_total_mid = content_max_w - w_left - w_right - (2 * gap)
+                avail_title = avail_total_mid - w_mid_static - w_mid_sep
+                for item in mid_items:
+                    if item['key'] == 'title':
+                        item['text'] = truncate_to_fit(item['text'], avail_title)
+                        item['width'] = font.getlength(item['text'])
+                        item['reserved'] = item['width']
+
+            # DRAW LEFT
+            draw.text((margin_x, y), left_item['text'], font=font, fill=(0, 0, 0))
+
+            # DRAW RIGHT
+            slot_x_r = self.screen_width - margin_x - right_item['reserved']
+            draw_x_r = slot_x_r + (right_item['reserved'] - right_item['width'])
+            draw.text((draw_x_r, y), right_item['text'], font=font, fill=(0, 0, 0))
+
+            # DRAW MIDDLE
+            if mid_items:
+                mid_block_w = sum(x['reserved'] for x in mid_items) + w_mid_sep
+                mid_start_x = (self.screen_width - mid_block_w) // 2
+                min_x = margin_x + left_item['reserved'] + gap
+                max_x = self.screen_width - margin_x - right_item['reserved'] - gap - mid_block_w
+
+                if mid_start_x < min_x: mid_start_x = min_x
+                if mid_start_x > max_x: mid_start_x = max_x
+
+                if max_x >= min_x:
+                    curr_mx = mid_start_x
+                    for i, item in enumerate(mid_items):
+                        dx = curr_mx + (item['reserved'] - item['width']) // 2
+                        draw.text((dx, y), item['text'], font=font, fill=(0, 0, 0))
+                        curr_mx += item['reserved']
+                        if i < len(mid_items) - 1:
+                            draw.text((curr_mx, y), separator, font=font, fill=(0, 0, 0))
+                            curr_mx += sep_w
+        else:
+            avail_for_title = content_max_w - non_title_w - total_sep_w
+            for item in processed_elements:
+                if item['key'] == 'title':
+                    item['text'] = truncate_to_fit(item['text'], avail_for_title)
+                    item['width'] = font.getlength(item['text'])
+                    item['reserved'] = item['width']
+
+            total_block_w = sum(x['reserved'] for x in processed_elements) + total_sep_w
+            x_pos = margin_x
+            if align == "Center":
+                x_pos = (self.screen_width - total_block_w) // 2
+            elif align == "Right":
+                x_pos = self.screen_width - margin_x - total_block_w
+            if x_pos < margin_x: x_pos = margin_x
+
+            curr_x = x_pos
+            for i, item in enumerate(processed_elements):
+                dx = curr_x + (item['reserved'] - item['width']) // 2
+                draw.text((dx, y), item['text'], font=font, fill=(0, 0, 0))
+                curr_x += item['reserved']
+                if i < len(processed_elements) - 1:
+                    draw.text((curr_x, y), separator, font=font, fill=(0, 0, 0))
+                    curr_x += sep_w
 
     def _get_active_elements(self, bar_role, text_data):
         s = self.layout_settings
@@ -1744,6 +2152,12 @@ class EpubProcessor:
                 order = int(s.get(f"order_{key}", 99))
                 content = text_data.get(key, "")
                 if content: active.append((order, key, content))
+        # Check for Inline Progress Bar
+        pos_prog = s.get("pos_progress", "Footer (Below Text)")
+        if pos_prog == f"{bar_role} (Inline)":
+            order = int(s.get("order_progress", 99))
+            active.append((order, 'progress', '__PROGRESS_BAR__'))
+
         active.sort(key=lambda x: x[0])
         return [(x[1], x[2]) for x in active]
 
@@ -1772,7 +2186,8 @@ class EpubProcessor:
             self._draw_progress_bar(draw, current_y, bar_height, global_page_index)
             current_y += bar_height + gap
         if has_text:
-            self._draw_text_line(draw, current_y, font_ui, elements, align)
+            self._draw_text_line(draw, current_y, font_ui, elements, align, global_page_index)
+
             current_y += font_size + gap
         if not bar_above_text and has_bar: self._draw_progress_bar(draw, current_y, bar_height, global_page_index)
 
@@ -1813,34 +2228,33 @@ class EpubProcessor:
         elif has_bar:
             bar_y = anchor_y - bar_h
         if has_bar: self._draw_progress_bar(draw, bar_y, bar_height, global_page_index)
-        if has_text: self._draw_text_line(draw, text_y, font_ui, elements, align)
+        if has_text: self._draw_text_line(draw, text_y, font_ui, elements, align, global_page_index)
 
         # --- INSIDE CLASS EpubProcessor ---
 
     def _protect_formatting(self, soup, css_text):
         """
-        Refined: Strips rigid layout locks but PRESERVES structural indentation (poems/letters)
-        and meaningful scene breaks.
+        Refined: Strips rigid layout locks but PRESERVES structural indentation.
+        Aggressively propagates spacing classes to children to fix nested span resets.
         """
+
         spacing_classes = set()
 
-        # 1. HARD KILL PATTERN: Things that break the screen flow.
-        # We REMOVE margin-left/padding-left/margin-top from this list to handle them intelligently below.
+        # 1. HARD KILL PATTERN (Layout locks)
         nuclear_pattern = re.compile(
-            r'(?:^|;)\s*(width|height|max-width|max-height|line-height|'
-            r'background-color)\s*:[^;]+',
+            r'(?:^|;)\s*(width|height|max-width|max-height|line-height|background-color)\s*:[^;]+',
             flags=re.IGNORECASE
         )
 
-        # 2. FONT KILL PATTERN: Kill absolute sizes, allow relatives if you want (or kill all).
-        # Currently set to kill absolute units but keep em/%.
+        # 2. FONT KILL PATTERN (Absolute sizes)
         absolute_font_pattern = re.compile(
             r'(?:^|;)\s*font-size\s*:\s*[\d\.]+(?:px|cm|mm|in|pc|pt)\s*(?:!important)?',
             flags=re.IGNORECASE
         )
 
+        # --- PHASE 1: CLEAN ATTRIBUTES & STYLES ---
         for tag in soup.find_all(True):
-            # A. Attribute Cleaning (Keep basic table attributes if needed, but usually strip)
+            # A. Attribute Cleaning
             if tag.name not in ['img', 'table', 'td', 'th']:
                 if tag.has_attr('width'): del tag['width']
                 if tag.has_attr('height'): del tag['height']
@@ -1848,41 +2262,26 @@ class EpubProcessor:
             # B. Style Cleaning
             style = tag.get('style')
             if style:
-                # 1. Preserve Alignment
                 alignment_match = re.search(r'text-align\s*:\s*(center|right|justify)', style, re.I)
-
-                # 2. Preserve Indentation (Vital for poems/letters)
-                # We look for margin-left or padding-left > 0
                 indent_match = re.search(r'(margin-left|padding-left)\s*:\s*([\d\.]+(?:em|px|%|pt))', style, re.I)
-
-                # 3. Preserve Scene Breaks (Large top margins)
-                # If margin-top is significant (>1em or >20px), we might want to keep it or swap it for a <br>
                 top_margin_match = re.search(r'margin-top\s*:\s*([\d\.]+(?:em|px|%|pt))', style, re.I)
 
-                # 4. Run the Nuclear Kill List
                 clean_style = nuclear_pattern.sub('', style)
                 clean_style = absolute_font_pattern.sub('', clean_style)
 
-                # 5. Re-inject Preserved Properties
                 injections = []
-
                 if alignment_match:
                     align_val = alignment_match.group(1).lower()
                     injections.append(f"text-align: {align_val} !important")
                     if align_val in ['center', 'right']:
                         injections.append("text-indent: 0 !important")
-
                 if indent_match:
-                    # We keep the indentation but cap it at 20% to prevent it going off-screen on small devices
                     val = indent_match.group(2)
                     if '%' in val and float(val.strip('%')) > 20: val = "10%"
                     injections.append(f"margin-left: {val}")
-
                 if top_margin_match:
-                    # If there's a top margin, we ensure it's honored but safe
-                    injections.append(f"margin-top: 1.5em")
+                    injections.append("margin-top: 1.5em")
 
-                # Rebuild style
                 clean_style = clean_style.strip().strip(';')
                 if injections:
                     clean_style += "; " + "; ".join(injections)
@@ -1892,7 +2291,7 @@ class EpubProcessor:
                 else:
                     del tag['style']
 
-        # --- PHASE 2: CSS PARSING (Preserved from your original) ---
+        # --- PHASE 2: PARSE CSS FOR SPACING CLASSES ---
         if css_text:
             css_clean = re.sub(r'\s+', ' ', css_text).lower()
             css_clean = re.sub(r'/\*.*?\*/', '', css_clean)
@@ -1903,43 +2302,72 @@ class EpubProcessor:
                 if len(parts) < 2: continue
                 selector_str = parts[0].strip()
                 prop_str = parts[1].strip()
-                found_classes = re.findall(r'\.([a-z0-9_-]+)', selector_str)
-                if not found_classes: continue
-                if re.search(r'letter-spacing\s*:\s*(?!0|normal)', prop_str):
-                    for cls in found_classes: spacing_classes.add(cls)
 
-        # --- PHASE 3: APPLY SPACING (Preserved) ---
-        target_tags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span', 'blockquote', 'li']
+                # Check for letter-spacing property
+                if re.search(r'letter-spacing\s*:\s*(?!0|normal)', prop_str):
+                    found_classes = re.findall(r'\.([a-z0-9_-]+)', selector_str)
+                    if found_classes:
+
+                        for cls in found_classes:
+                            spacing_classes.add(cls)
+
+        # --- PHASE 3: APPLY SPACING (RECURSIVE FIX) ---
+
+        # Helper to safely add class
+        def add_class(element, cls_name):
+            existing = element.get('class', [])
+            if isinstance(existing, str): existing = [existing]
+            if cls_name not in existing:
+                existing.append(cls_name)
+                element['class'] = existing
+
+        # Broad list of tags that might carry text or formatting
+        target_tags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                       'span', 'blockquote', 'li', 'i', 'em', 'b', 'strong', 'a', 'font', 'small', 'big']
+
+        # 1. Identify ROOTS: Elements that trigger the spacing
+        roots_to_space = []
         for tag in soup.find_all(target_tags):
-            classes = tag.get('class', [])
-            if isinstance(classes, str): classes = [classes]
             should_space = tag.get('data-letter-spacing') == 'true'
+
+            # Check class match
             if not should_space:
+                classes = tag.get('class', [])
+                if isinstance(classes, str): classes = [classes]
                 for cls in classes:
                     if cls.lower() in spacing_classes:
                         should_space = True
                         break
+
             if should_space:
-                THIN_SPACE = '\u2009'
-                SOFT_HYPHEN = '\u00AD'
-                for text_node in tag.find_all(string=True):
-                    if not text_node.strip() or text_node.parent.name == 'rt': continue
-                    txt = str(text_node)
-                    if THIN_SPACE in txt: continue
-                    new_chars = []
-                    for i, char in enumerate(txt):
-                        new_chars.append(char)
-                        is_last = (i == len(txt) - 1)
-                        next_char = txt[i + 1] if not is_last else None
-                        if char != SOFT_HYPHEN and next_char != SOFT_HYPHEN and not is_last:
-                            new_chars.append(THIN_SPACE)
-                    text_node.replace_with(NavigableString("".join(new_chars)))
+                roots_to_space.append(tag)
+
+        # 2. Apply to Roots AND ALL DESCENDANTS
+        # 2. Apply to Roots AND ALL DESCENDANTS
+        for root in roots_to_space:
+            # Apply class
+            add_class(root, 'custom-spaced')
+
+            # FORCE INLINE STYLE (The Nuclear Option)
+            # We prepend our font rule to any existing styles
+            current_style = root.get('style', '')
+            root['style'] = "font-family: 'CustomFontSpaced' !important; " + current_style
+
+            # Find all nested children that might hold text
+            children = root.find_all(target_tags)
+
+            for child in children:
+                add_class(child, 'custom-spaced')
+
+                # FORCE INLINE STYLE ON CHILDREN TOO
+                # This defeats .reset { font-family: inherit !important }
+                child_style = child.get('style', '')
+                child['style'] = "font-family: 'CustomFontSpaced' !important; " + child_style
+
+                # Debug print to confirm injection
+                txt = child.get_text(strip=True).lower()
 
         return soup
-
-
-
-
 
     def render_page(self, global_page_index):
         if not self.is_ready: return None
@@ -2080,6 +2508,14 @@ class EpubProcessor:
                         draw_y = max(header_padding, paste_y + px_y - annot_font_size + 2)
                         draw.text((draw_x, draw_y), defi, font=annot_font, fill=(0, 0, 0))
 
+        # --- PREVIEW ROTATION LOGIC ---
+        ori = self.layout_settings.get("orientation", "Portrait")
+        if "Landscape" in ori:
+            # Determine angle: 90 (CCW) or 270 (CW)
+            angle = 270 if "270" in ori else 90
+            img_final = img_final.rotate(angle, expand=True)
+        # ------------------------------
+
         return img_final
 
     def _pack_metadata(self, title, author, lang, chapter_count):
@@ -2151,77 +2587,48 @@ class EpubProcessor:
         for i in range(self.total_pages):
             if progress_callback: progress_callback((i + 1) / self.total_pages)
 
+            # 1. Get the page
+            # render_page ALREADY handles the rotation for Landscape modes now.
+            # So img_rgb comes out as 480x800 (Portrait dimensions, sideways text).
             img_rgb = self.render_page(i)
             img_gray = img_rgb.convert("L")
 
-            # --- FIX: ROTATE PIXELS FOR LANDSCAPE MODE ---
-            if self.layout_settings.get("orientation") == "Landscape":
-                # Rotate 90 degrees clockwise (or -90 for counter-clockwise)
-                # expand=True swaps the dimensions from 800x480 back to 480x800
-                img_gray = img_gray.rotate(90, expand=True)
-            # ---------------------------------------------
-
+            # 2. Get dimensions (No extra rotation needed here!)
             w, h = img_gray.size
 
             if is_2bit:
-                # --- XTH 2-BIT VERTICAL SCAN ORDER ---
-
+                # ... (Keep existing 2-bit logic exactly as is) ...
+                # [Copy the existing 2-bit logic here]
                 if render_mode == "Dither":
-                    # 1. Convert to RGB to ensure PIL matches colors correctly
                     img_input = img_gray.convert("RGB")
-
                     pal = Image.new('P', (1, 1))
-
-                    # --- PALETTE DEFINITION ---
-                    # We need: White(255) -> Index 0
-                    # We need: Black(0)   -> Index 3
-
-                    # If your image is NEGATIVE, it means White is mapping to 3.
-                    # Use THIS palette to fix it:
                     pal.putpalette([
-                                       255, 255, 255,  # Index 0: White      (Maps to hardware '00')
-                                       85, 85, 85,  # Index 1: Dark Grey  (Maps to hardware '01')
-                                       170, 170, 170,  # Index 2: Light Grey (Maps to hardware '10')
-                                       0, 0, 0,  # Index 3: Black      (Maps to hardware '11')
+                                       255, 255, 255,
+                                       85, 85, 85,
+                                       170, 170, 170,
+                                       0, 0, 0,
                                    ] + [0] * 756)
-
-
-                    # Force PIL to map pixels to the nearest color in our strict palette
                     quant = img_input.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
-
                 else:
-                    # Threshold Logic (Confirmed Working)
-                    # Maps White(255) -> 0
-                    # Maps Black(0)   -> 3
                     quant = img_gray.point(lambda p: 3 - (p // 64))
 
                 pix = quant.load()
-
                 bytes_per_col = (h + 7) // 8
                 p1, p2 = bytearray(bytes_per_col * w), bytearray(bytes_per_col * w)
 
-                # Scan: Right to Left -> Top to Bottom
                 for x_idx, x in enumerate(range(w - 1, -1, -1)):
                     for y in range(h):
                         val = pix[x, y] & 0x03
-
-                        # --- OPTIONAL SAFETY CHECK ---
-                        # If you still get negative middle greys, swap 1 and 2 here manually:
-                        # if val == 1: val = 2
-                        # elif val == 2: val = 1
-                        # -----------------------------
-
                         bit1 = (val >> 1) & 0x01
                         bit2 = val & 0x01
-
                         target_byte = (x_idx * bytes_per_col) + (y // 8)
-                        bit_pos = 7 - (y % 8)  # MSB is top
-
+                        bit_pos = 7 - (y % 8)
                         if bit1: p1[target_byte] |= (1 << bit_pos)
                         if bit2: p2[target_byte] |= (1 << bit_pos)
 
                 bitmap_data = bytes(p1) + bytes(p2)
                 data_size = len(bitmap_data)
+
             else:
                 # --- XTG 1-BIT ROW-MAJOR ---
                 if render_mode == "Dither":
@@ -2258,6 +2665,7 @@ class EpubProcessor:
             f.write(chapter_block)
             f.write(index_table)
             f.write(blob_data)
+
 
 # --- UI COLORS ---
 COLOR_BG = "#111111"
@@ -2385,6 +2793,7 @@ class ModernApp(ctk.CTk):
             ("lbl_marker_size", "slider_bar_marker_radius"),
             ("lbl_tick_height", "slider_bar_tick_height"),
             ("lbl_bar_thick", "slider_bar_height"),
+            ("lbl_ui_margin", "slider_ui_side_margin"),
         ]
 
         for lbl_attr, sld_attr in sliders:
@@ -2456,12 +2865,20 @@ class ModernApp(ctk.CTk):
         r_font.pack(fill="x", pady=2)
         ctk.CTkLabel(r_font, text="Font Family:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
         self.available_fonts = get_local_fonts()
-        self.font_options = ["Default (System)"] + sorted(list(self.available_fonts.keys()))
+        if not self.available_fonts:
+            self.available_fonts = {"No Fonts Found": ""}
+
+        self.font_options = sorted(list(self.available_fonts.keys()))
         self.font_map = self.available_fonts.copy()
-        self.font_map["Default (System)"] = "DEFAULT"
         self.font_dropdown = ctk.CTkOptionMenu(r_font, values=self.font_options, command=self.on_font_change, height=22,
                                                font=("Arial", 12))
-        self.font_dropdown.set(self.startup_settings.get("font_name", "Default (System)"))
+
+        start_font = self.startup_settings.get("font_name", "")
+        if start_font in self.font_options:
+            self.font_dropdown.set(start_font)
+        elif self.font_options:
+            self.font_dropdown.set(self.font_options[0])
+
         self.font_dropdown.pack(side="right", fill="x", expand=True)
         r_align = ctk.CTkFrame(c_type.content, fg_color="transparent")
         r_align.pack(fill="x", pady=2)
@@ -2470,9 +2887,15 @@ class ModernApp(ctk.CTk):
                                                 height=22, font=("Arial", 12))
         self.align_dropdown.set(self.startup_settings["text_align"])
         self.align_dropdown.pack(side="right", fill="x", expand=True)
+
+        self.var_hyphenate = ctk.BooleanVar(value=self.startup_settings.get("hyphenate_text", True))
+        ctk.CTkCheckBox(c_type.content, text="Hyphenate Text", variable=self.var_hyphenate, command=self.schedule_update, font=("Arial", 12)).pack(anchor="w", pady=5, padx=5)
+
         self._create_slider(c_type.content, "lbl_size", "Font Size", "slider_font_size", 12, 48)
         self._create_slider(c_type.content, "lbl_weight", "Font Weight", "slider_font_weight", 100, 900)
         self._create_slider(c_type.content, "lbl_line", "Line Height", "slider_line_height", 1.0, 2.5, is_float=True)
+        self._create_slider(c_type.content, "lbl_word_space", "Word Spacing", "slider_word_spacing", 0.0, 2.0,
+                            is_float=True)
 
         # --- LAYOUT ---
         c_lay = SettingsCard(self.sidebar, "PAGE LAYOUT")
@@ -2480,7 +2903,8 @@ class ModernApp(ctk.CTk):
         r_ori.pack(fill="x", pady=2)
         ctk.CTkLabel(r_ori, text="Orientation:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
         self.orientation_var = ctk.StringVar(value=self.startup_settings["orientation"])
-        ctk.CTkOptionMenu(r_ori, values=["Portrait", "Landscape"], variable=self.orientation_var,
+        ctk.CTkOptionMenu(r_ori, values=["Portrait", "Landscape (90°)", "Landscape (270°)"],
+                          variable=self.orientation_var,
                           command=self.schedule_update, height=22, font=("Arial", 12)).pack(side="right", fill="x",
                                                                                             expand=True)
         r_tog = ctk.CTkFrame(c_lay.content, fg_color="transparent")
@@ -2503,7 +2927,6 @@ class ModernApp(ctk.CTk):
         # We use a trace to trigger the auto-reload when the user types
         self.var_toc_page.trace_add("write", lambda *args: self.schedule_update())
         ctk.CTkEntry(r_toc_pos, textvariable=self.var_toc_page, width=50, height=22).pack(side="right")
-
 
         # --- HEADER & FOOTER ---
         c_hf = SettingsCard(self.sidebar, "HEADER & FOOTER")
@@ -2621,9 +3044,15 @@ class ModernApp(ctk.CTk):
         ctk.CTkLabel(row_progress, text="Position:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
         self.var_pos_progress = ctk.StringVar(value=self.startup_settings.get("pos_progress", "Footer (Below Text)"))
         ctk.CTkOptionMenu(row_progress, variable=self.var_pos_progress,
-                          values=["Header (Above Text)", "Header (Below Text)", "Footer (Above Text)",
-                                  "Footer (Below Text)", "Hidden"], command=self.schedule_update, height=22,
-                          font=("Arial", 12)).pack(side="right", fill="x", expand=True)
+                          values=["Header (Above Text)", "Header (Below Text)", "Header (Inline)",
+                                  "Footer (Above Text)", "Footer (Below Text)", "Footer (Inline)", "Hidden"],
+                          command=self.schedule_update, height=22, font=("Arial", 12)).pack(side="left", fill="x",
+                                                                                            expand=True, padx=5)
+
+        self.var_order_progress = ctk.StringVar(value=str(self.startup_settings.get("order_progress", 5)))
+        self.var_order_progress.trace_add("write", lambda *args: self.schedule_update())
+        ctk.CTkEntry(row_progress, textvariable=self.var_order_progress, width=35, height=22).pack(side="right")
+
         row_chk = ctk.CTkFrame(c_hf.content, fg_color="transparent")
         row_chk.pack(fill="x", pady=5)
         self.var_bar_ticks = ctk.BooleanVar(value=self.startup_settings.get("bar_show_ticks", True))
@@ -2656,6 +3085,29 @@ class ModernApp(ctk.CTk):
         self._create_slider(f_adv, "lbl_header_size", "Header Font Size", "slider_header_font_size", 8, 30)
         self._create_slider(f_adv, "lbl_header_margin", "Header Y-Offset", "slider_header_margin", 0, 80)
         self._create_divider_horizontal(f_adv)
+
+        r_ui_style = ctk.CTkFrame(f_adv, fg_color="transparent")
+        r_ui_style.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_ui_style, text="UI Font:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.var_ui_font = ctk.StringVar(value=self.startup_settings.get("ui_font_source", "Body Font"))
+        ctk.CTkOptionMenu(r_ui_style, variable=self.var_ui_font, values=["Body Font", "Sans-Serif", "Serif"],
+                          command=self.schedule_update, height=22, font=("Arial", 12)).pack(side="right", fill="x",
+                                                                                            expand=True)
+
+        r_sep = ctk.CTkFrame(f_adv, fg_color="transparent")
+        r_sep.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_sep, text="Separator:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.entry_separator = ctk.CTkComboBox(r_sep, height=22,
+                                               values=["   |   ", "   -   ", "   •   ", "   ~   ", "   //   ", "   * "],
+                                               command=self.schedule_update, font=("Arial", 12))
+        self.entry_separator.set(self.startup_settings.get("ui_separator", "   |   "))
+        self.entry_separator.pack(side="right", fill="x", expand=True)
+        if hasattr(self.entry_separator, "_entry"): self.entry_separator._entry.bind("<KeyRelease>",
+                                                                                     self.schedule_update)
+
+        self._create_slider(f_adv, "lbl_ui_margin", "Side Margin", "slider_ui_side_margin", 0, 100)
+        self._create_divider_horizontal(f_adv)
+
         r_f_align = ctk.CTkFrame(f_adv, fg_color="transparent")
         r_f_align.pack(fill="x", pady=2)
         ctk.CTkLabel(r_f_align, text="Footer Align:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
@@ -2715,8 +3167,9 @@ class ModernApp(ctk.CTk):
         self.entry_page.bind('<Return>', lambda e: self.go_to_page())
         ctk.CTkButton(f_nav, text="▶", width=40, command=self.next_page, fg_color="#333").pack(side="left", padx=5)
         f_zoom = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
-        f_zoom.pack(side="right", padx=20, pady=10)
-        self._create_slider(f_zoom, "lbl_preview_zoom", "Zoom", "slider_preview_zoom", 200, 800, width=150)
+        f_zoom.place(relx=0.97, rely=0.5, anchor="e")  # Pins it to the right edge vertically centered
+        self._create_slider(f_zoom, "lbl_preview_zoom", "Zoom", "slider_preview_zoom", 200, 800, width=150,
+                            label_width=75)
 
     def _create_icon_btn(self, parent, text, hover_col, cmd, state="normal"):
         b = ctk.CTkButton(parent, text=text, command=cmd, state=state, width=110, height=35, corner_radius=8,
@@ -2730,37 +3183,91 @@ class ModernApp(ctk.CTk):
     def _create_divider_horizontal(self, parent):
         ctk.CTkFrame(parent, height=2, fg_color="#333").pack(fill="x", pady=10)
 
-    def _create_slider(self, parent, label_attr, text, slider_attr, min_v, max_v, is_float=False, width=None, trigger_auto_update=True):
+    def _create_slider(self, parent, label_attr, text, slider_attr, min_v, max_v, is_float=False, width=None,
+                       trigger_auto_update=True, label_width=130):
         f = ctk.CTkFrame(parent, fg_color="transparent")
         f.pack(fill="x", pady=2)
 
         setting_key = slider_attr.replace('slider_', '')
         default_val = self.startup_settings.get(setting_key, min_v)
 
-        # Helper to format the label text
+        # Helper to format values
+        def get_fmt_val(val):
+            return float(f"{val:.1f}") if is_float else int(val)
+
         def get_label_text(val):
-            v_num = float(val) if is_float else int(val)
-            fmt = f"{v_num:.1f}" if is_float else f"{v_num}"
-            return f"{text}: {fmt}"
+            v_num = get_fmt_val(val)
+            return f"{text}: {v_num}"
 
-        lbl = ctk.CTkLabel(f, text=get_label_text(default_val), font=("Arial", 12), anchor="w", width=130)
+        # 1. Label
+        lbl = ctk.CTkLabel(f, text=get_label_text(default_val), font=("Arial", 12), anchor="w", width=label_width)
         lbl.pack(side="left")
-        setattr(self, label_attr, lbl)
 
-        # This logic handles the "suppress update" for Spectra sliders
+        # 2. Entry Field (Created before slider so callback can reference it)
+        entry = ctk.CTkEntry(f, width=50, height=22, font=("Arial", 11))
+        entry.pack(side="right", padx=(5, 0))
+
+        # 3. Slider Callback (Updates Entry + Label)
         def on_slide(val):
             lbl.configure(text=get_label_text(val))
+
+            # Sync slider drag to entry text
+            current_val = get_fmt_val(val)
+            # Only update if different to prevent typing glitches
+            if entry.get() != str(current_val):
+                entry.delete(0, "end")
+                entry.insert(0, str(current_val))
+
             if trigger_auto_update:
                 self.schedule_update()
 
+        # 4. Slider Widget
         sld = ctk.CTkSlider(f, from_=min_v, to=max_v, command=on_slide, height=16)
         if width: sld.configure(width=width)
         sld.set(default_val)
         sld.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-        # Store the formatter and slider for the refresh_all_slider_labels method
+        # 5. Entry Callback (Validates Input -> Updates Slider)
+        def on_entry_change(event=None):
+            try:
+                val_str = entry.get()
+                val = float(val_str) if is_float else int(val_str)
+
+                # Clamp value to min/max
+                if val < min_v: val = min_v
+                if val > max_v: val = max_v
+
+                # Update UI
+                sld.set(val)
+                lbl.configure(text=get_label_text(val))
+
+                # Format entry text nicely
+                entry.delete(0, "end")
+                entry.insert(0, str(val))
+
+                # Trigger App Update
+                if trigger_auto_update:
+                    self.schedule_update()
+
+                # Remove focus from entry so hotkeys work again
+                self.focus_set()
+
+            except ValueError:
+                # Invalid number? Revert to current slider value
+                entry.delete(0, "end")
+                entry.insert(0, str(get_fmt_val(sld.get())))
+
+        # Bind Enter Key and Focus Out
+        entry.bind("<Return>", on_entry_change)
+        entry.bind("<FocusOut>", on_entry_change)
+
+        # Set Initial Entry Value
+        entry.insert(0, str(get_fmt_val(default_val)))
+
+        # Register attributes
         setattr(self, f"fmt_{slider_attr}", get_label_text)
         setattr(self, slider_attr, sld)
+
         return sld
 
     def toggle_render_controls(self, _=None):
@@ -2807,7 +3314,6 @@ class ModernApp(ctk.CTk):
             self.selected_chapter_indices,
             self._on_chapters_selected
         )
-
 
     def _on_chapters_selected(self, selected_indices):
         self.selected_chapter_indices = selected_indices
@@ -2966,13 +3472,14 @@ class ModernApp(ctk.CTk):
 
     def open_cover_export(self):
         if self.processor.cover_image_obj:
-            CoverExportDialog(self, self._process_cover_export)
+            fname = "cover.bmp"
+            if hasattr(self.processor, 'title_metadata') and self.processor.title_metadata:
+                safe = "".join([c for c in self.processor.title_metadata if c.isalnum() or c in " -_"]).strip()
+                if safe: fname = f"{safe}.bmp"
+            path = filedialog.asksaveasfilename(defaultextension=".bmp", initialfile=fname, filetypes=[("Bitmap", "*.bmp")])
+            if path: threading.Thread(target=lambda: self._run_cover_export(path, 480, 800, "Crop to Fill (Best)")).start()
         else:
             messagebox.showinfo("Info", "No cover found.")
-
-    def _process_cover_export(self, w, h, mode):
-        path = filedialog.asksaveasfilename(defaultextension=".bmp", filetypes=[("Bitmap", "*.bmp")])
-        if path: threading.Thread(target=lambda: self._run_cover_export(path, w, h, mode)).start()
 
     def _run_cover_export(self, path, w, h, mode):
         try:
@@ -2985,8 +3492,7 @@ class ModernApp(ctk.CTk):
             else:
                 img = ImageOps.fit(img, (w, h), centering=(0.5, 0.5))
             img = img.convert("L")
-            img = ImageEnhance.Contrast(img).enhance(1.3)
-            img = ImageEnhance.Brightness(img).enhance(1.05)
+            img = ImageEnhance.Contrast(img).enhance(1.6)
             img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
             img.save(path, format="BMP")
             self.update_progress_ui(1.0, "Done")
@@ -3029,9 +3535,11 @@ class ModernApp(ctk.CTk):
         spectra_key = self.entry_spectra_key.get() if hasattr(self, 'entry_spectra_key') else ""
         spectra_url = self.entry_spectra_url.get() if hasattr(self, 'entry_spectra_url') else ""
         spectra_model = self.entry_spectra_model.get() if hasattr(self, 'entry_spectra_model') else ""
-        spectra_thresh = float(self.slider_spectra_threshold.get()) if hasattr(self, 'slider_spectra_threshold') else 4.0
+        spectra_thresh = float(self.slider_spectra_threshold.get()) if hasattr(self,
+                                                                               'slider_spectra_threshold') else 4.0
         # NEW AoA
-        spectra_aoa = float(self.slider_spectra_aoa_threshold.get()) if hasattr(self, 'slider_spectra_aoa_threshold') else 0.0
+        spectra_aoa = float(self.slider_spectra_aoa_threshold.get()) if hasattr(self,
+                                                                                'slider_spectra_aoa_threshold') else 0.0
         spectra_lang = self.var_spectra_lang.get() if hasattr(self, 'var_spectra_lang') else "English"
 
         try:
@@ -3044,11 +3552,13 @@ class ModernApp(ctk.CTk):
             "font_size": int(self.slider_font_size.get()),
             "font_weight": int(self.slider_font_weight.get()),
             "line_height": float(self.slider_line_height.get()),
+            "word_spacing": float(self.slider_word_spacing.get()),
             "margin": int(self.slider_margin.get()),
             "top_padding": int(self.slider_top_padding.get()),
             "bottom_padding": int(self.slider_bottom_padding.get()),
             "orientation": self.orientation_var.get(),
             "text_align": self.align_dropdown.get(),
+            "hyphenate_text": self.var_hyphenate.get(),
             "font_name": self.font_dropdown.get(),
             "preview_zoom": int(self.slider_preview_zoom.get()),
             "generate_toc": self.var_toc.get(),
@@ -3059,6 +3569,7 @@ class ModernApp(ctk.CTk):
             "pos_chap_page": self.var_pos_chap_page.get(),
             "pos_percent": self.var_pos_percent.get(),
             "pos_progress": self.var_pos_progress.get(),
+            "order_progress": get_order("var_order_progress"),
             "order_title": get_order("var_order_title"),
             "order_pagenum": get_order("var_order_pagenum"),
             "order_chap_page": get_order("var_order_chap_page"),
@@ -3071,6 +3582,9 @@ class ModernApp(ctk.CTk):
             "header_align": self.var_header_align.get(),
             "header_font_size": int(self.slider_header_font_size.get()),
             "header_margin": int(self.slider_header_margin.get()),
+            "ui_font_source": self.var_ui_font.get(),
+            "ui_separator": self.entry_separator.get(),
+            "ui_side_margin": int(self.slider_ui_side_margin.get()),
             "footer_align": self.var_footer_align.get(),
             "footer_font_size": int(self.slider_footer_font_size.get()),
             "footer_margin": int(self.slider_footer_margin.get()),
@@ -3140,11 +3654,13 @@ class ModernApp(ctk.CTk):
         self.slider_font_size.set(s['font_size'])
         self.slider_font_weight.set(s['font_weight'])
         self.slider_line_height.set(s['line_height'])
+        self.slider_word_spacing.set(s.get('word_spacing', 0.0))
         self.slider_margin.set(s['margin'])
         self.slider_top_padding.set(s['top_padding'])
         self.slider_bottom_padding.set(s['bottom_padding'])
         self.orientation_var.set(s['orientation'])
         self.align_dropdown.set(s['text_align'])
+        self.var_hyphenate.set(s.get('hyphenate_text', True))
         self.slider_preview_zoom.set(s['preview_zoom'])
         self.var_toc.set(s['generate_toc'])
         self.var_footnotes.set(s.get('show_footnotes', True))
@@ -3156,6 +3672,7 @@ class ModernApp(ctk.CTk):
         self.var_pos_chap_page.set(s['pos_chap_page'])
         self.var_pos_percent.set(s['pos_percent'])
         self.var_pos_progress.set(s['pos_progress'])
+        self.var_order_progress.set(str(s.get('order_progress', 5)))
         self.var_order_title.set(str(s['order_title']))
         self.var_order_pagenum.set(str(s['order_pagenum']))
         self.var_order_chap_page.set(str(s['order_chap_page']))
@@ -3168,6 +3685,9 @@ class ModernApp(ctk.CTk):
         self.var_header_align.set(s['header_align'])
         self.slider_header_font_size.set(s['header_font_size'])
         self.slider_header_margin.set(s['header_margin'])
+        self.var_ui_font.set(s.get('ui_font_source', "Body Font"))
+        self.entry_separator.set(s.get('ui_separator', "   |   "))
+        self.slider_ui_side_margin.set(s.get('ui_side_margin', 15))
         self.var_footer_align.set(s['footer_align'])
         self.slider_footer_font_size.set(s['footer_font_size'])
         self.slider_footer_margin.set(s['footer_margin'])
@@ -3212,9 +3732,9 @@ class ModernApp(ctk.CTk):
         if s["font_name"] in self.font_options:
             self.font_dropdown.set(s["font_name"])
             self.processor.font_path = self.font_map[s["font_name"]]
-        else:
-            self.font_dropdown.set("Default (System)")
-            self.processor.font_path = self.font_map["Default (System)"]
+        elif self.font_options:
+            self.font_dropdown.set(self.font_options[0])
+            self.processor.font_path = self.font_map[self.font_options[0]]
 
         self.toggle_render_controls()
         self.schedule_update()

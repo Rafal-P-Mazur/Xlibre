@@ -26,6 +26,8 @@ class LibraryDB:
             cover_blob BLOB,
             render_settings TEXT, 
             status TEXT DEFAULT 'Unread',
+            rating INTEGER DEFAULT 0,
+            notes TEXT,
             added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
@@ -67,7 +69,9 @@ class LibraryDB:
             "publish_date": "TEXT",
             "cover_blob": "BLOB",
             "render_settings": "TEXT",
-            "status": "TEXT DEFAULT 'Unread'"
+            "status": "TEXT DEFAULT 'Unread'",
+            "rating": "INTEGER DEFAULT 0",
+            "notes": "TEXT"
         }
 
         for col, col_type in required.items():
@@ -100,6 +104,18 @@ class LibraryDB:
         self.conn.execute("UPDATE books SET status = ? WHERE id = ?", (status, book_id))
         self.conn.commit()
 
+    def update_book_rating(self, book_id, rating):
+        self.conn.execute("UPDATE books SET rating = ? WHERE id = ?", (rating, book_id))
+        self.conn.commit()
+
+    def update_book_notes(self, book_id, notes):
+        self.conn.execute("UPDATE books SET notes = ? WHERE id = ?", (notes, book_id))
+        self.conn.commit()
+
+    def update_book_description(self, book_id, description):
+        self.conn.execute("UPDATE books SET description = ? WHERE id = ?", (description, book_id))
+        self.conn.commit()
+
     def add_book(self, epub_path, title, author, description, genre, publisher, publish_date, cover_image_obj):
         blob = None
         if cover_image_obj:
@@ -124,7 +140,7 @@ class LibraryDB:
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT id, title, author, path_epub, path_xtc, cover_blob, render_settings, 
-            description, genre, publisher, publish_date, added_date, status 
+            description, genre, publisher, publish_date, added_date, status, rating, notes 
             FROM books ORDER BY added_date DESC
         """)
         return cursor.fetchall()
